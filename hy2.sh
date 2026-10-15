@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# Hysteria2 部署脚本（支持 SOCKS5 代理转发）
+# Hysteria2 多节点部署脚本（支持 SOCKS5 代理转发）
 # 典型链路：客户端 -> Hysteria2 -> SOCKS5 代理（可选）-> 目标网站
 
 set -euo pipefail
 
+# ---------- 多节点配置区 ----------
+# 在此处按顺序配置多个端口和对应的密码，数量必须一一对应
+NODE_PORTS=(22222 33333 44444)
+NODE_PASSWORDS=("ieshare2025" "ieshare2025" "ieshare2025")
+# ----------------------------------
+
 # ---------- 默认配置 ----------
 HYSTERIA_VERSION="${HYSTERIA_VERSION:-v2.6.5}"
-DEFAULT_PORT="${DEFAULT_PORT:-22222}"          # Hysteria2 默认监听端口
-AUTH_PASSWORD="${AUTH_PASSWORD:-ieshare2025}"  # Hysteria2 默认连接密码
 CERT_FILE="${CERT_FILE:-cert.pem}"             # 证书文件路径
 KEY_FILE="${KEY_FILE:-key.pem}"                # 私钥文件路径
 SNI="${SNI:-www.bing.com}"                     # 伪装域名
@@ -16,7 +20,7 @@ ALPN="${ALPN:-h3}"
 UP_BANDWIDTH="${UP_BANDWIDTH:-200mbps}"
 DOWN_BANDWIDTH="${DOWN_BANDWIDTH:-200mbps}"
 
-# SOCKS5 默认配置，兼容旧环境变量名
+# SOCKS5 默认配置
 SOCKS_IP="${SOCKS_IP:-${AIMILI_SOCKS_IP:-}}"
 SOCKS5_PORT="${SOCKS5_PORT:-${AIMILI_SOCKS5_PORT:-7928}}"
 SOCKS5_USER="${SOCKS5_USER:-${AIMILI_SOCKS5_USER:-}}"
@@ -25,44 +29,24 @@ MODE="${MODE:-tcp_only}"                       # tcp_only | all_proxy
 USE_SOCKS5="${USE_SOCKS5:-auto}"
 ACTION="install"
 BIN_PATH=""
-PID_FILE="hysteria.pid"
-LOG_FILE="hysteria.log"
 # ------------------------------
 
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-echo "Hysteria2 部署脚本（支持 SOCKS5 代理转发）"
+echo "Hysteria2 多节点部署脚本（支持 SOCKS5 代理转发）"
 echo "链路: 客户端 -> Hysteria2 -> SOCKS5 代理（可选）-> 目标网站"
-echo "支持参数: bash hy2.sh [监听端口] [socksIP|local] [SOCKS5_PORT] [模式]"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 
 usage() {
     cat <<'EOF'
 用法:
   bash hy2.sh
-  bash hy2.sh [监听端口]
-  bash hy2.sh [监听端口] [socksIP|local]
-  bash hy2.sh [监听端口] [socksIP|local] [SOCKS5_PORT]
-  bash hy2.sh [监听端口] [socksIP|local] [SOCKS5_PORT] [模式]
-  bash hy2.sh del
-  bash hy2.sh --uninstall
+  bash hy2.sh del / --uninstall
+
+多节点端口和密码请在脚本顶部的 NODE_PORTS 和 NODE_PASSWORDS 数组中修改。
 
 模式:
   tcp_only   仅 TCP 走代理，UDP 直连当前服务器（推荐，最稳）
   all_proxy  尽量 TCP/UDP 都走代理（取决于上游 SOCKS5 是否支持 UDP）
-
-示例:
-  bash hy2.sh 443 local 7928
-  bash hy2.sh 443 1.2.3.4 7928
-  bash hy2.sh 443 1.2.3.4 7928 all_proxy
-  SOCKS5_USER=user SOCKS5_PASS=pass bash hy2.sh 443 1.2.3.4 7928
-  bash hy2.sh del
-
-环境变量:
-  SOCKS_IP
-  SOCKS5_PORT
-  SOCKS5_USER
-  SOCKS5_PASS
-  MODE=tcp_only|all_proxy
 EOF
 }
 
@@ -79,7 +63,6 @@ tty_prompt_read() {
     local silent="${2:-0}"
     local value=""
 
-    # 直接写到 /dev/tty，避免 read -p 走 stderr 后在网页终端里延迟显示
     tty_print "$prompt"
     if [ "$silent" = "1" ]; then
         IFS= read -r -s value </dev/tty || true
@@ -298,16 +281,6 @@ choose_mode() {
     done
 }
 
-list_generated_files() {
-    printf '%s\n' "./server.yaml"
-    printf '%s\n' "./${CERT_FILE}"
-    printf '%s\n' "./${KEY_FILE}"
-    printf '%s\n' "./hysteria-linux-amd64"
-    printf '%s\n' "./hysteria-linux-arm64"
-    printf '%s\n' "./${PID_FILE}"
-    printf '%s\n' "./${LOG_FILE}"
-}
-
 parse_args() {
     local positional=()
 
@@ -336,35 +309,6 @@ parse_args() {
                 ;;
         esac
     done
-
-    if [[ ${#positional[@]} -ge 1 && -n "${positional[0]}" ]]; then
-        SERVER_PORT="${positional[0]}"
-        echo "✅ 使用命令行指定 Hysteria2 端口: $SERVER_PORT"
-    else
-        SERVER_PORT="${SERVER_PORT:-$DEFAULT_PORT}"
-    fi
-
-    if [[ ${#positional[@]} -ge 2 && -n "${positional[1]}" ]]; then
-        SOCKS_IP="$(normalize_socks_host "${positional[1]}")"
-        USE_SOCKS5="y"
-        echo "✅ 使用命令行指定 SOCKS5 代理地址: $SOCKS_IP"
-    fi
-
-    if [[ ${#positional[@]} -ge 3 && -n "${positional[2]}" ]]; then
-        SOCKS5_PORT="${positional[2]}"
-        echo "✅ 使用命令行指定 SOCKS5 代理端口: $SOCKS5_PORT"
-    fi
-
-    if [[ ${#positional[@]} -ge 4 && -n "${positional[3]}" ]]; then
-        MODE="${positional[3]}"
-        echo "✅ 使用命令行指定模式: $MODE"
-    fi
-
-    if [[ ${#positional[@]} -gt 4 ]]; then
-        echo "❌ 参数过多。"
-        usage
-        exit 1
-    fi
 }
 
 interactive_config() {
@@ -372,8 +316,7 @@ interactive_config() {
     local proxy_choice="1"
     local value
 
-    ask_port "请输入 Hysteria2 监听端口" "$SERVER_PORT"
-    SERVER_PORT="$REPLY"
+    echo "📌 提示: 当前已配置 ${#NODE_PORTS[@]} 个节点端口。如需修改，请在脚本开头的数组中编辑。"
 
     if [ "$USE_SOCKS5" = "auto" ]; then
         if [ -n "$SOCKS_IP" ]; then
@@ -393,7 +336,7 @@ interactive_config() {
     fi
 
     while true; do
-        echo "请选择 SOCKS5 代理方式："
+        echo "请为所有节点选择 SOCKS5 代理方式："
         echo "1. 不使用 SOCKS5 代理，直接连接"
         echo "2. 使用本机 SOCKS5 代理（127.0.0.1）"
         echo "3. 使用远程 SOCKS5 代理"
@@ -476,10 +419,17 @@ interactive_config() {
 }
 
 validate_config() {
-    if ! validate_port "$SERVER_PORT"; then
-        echo "❌ Hysteria2 监听端口无效: $SERVER_PORT"
+    if [ "${#NODE_PORTS[@]}" -ne "${#NODE_PASSWORDS[@]}" ]; then
+        echo "❌ 配置错误: NODE_PORTS (端口) 和 NODE_PASSWORDS (密码) 数量不匹配！"
         exit 1
     fi
+
+    for port in "${NODE_PORTS[@]}"; do
+        if ! validate_port "$port"; then
+            echo "❌ Hysteria2 监听端口无效: $port"
+            exit 1
+        fi
+    done
 
     if [ "$USE_SOCKS5" = "y" ]; then
         SOCKS_IP="$(normalize_socks_host "$SOCKS_IP")"
@@ -514,8 +464,7 @@ validate_config() {
 print_summary() {
     echo "=========================================================================="
     echo "📋 配置确认:"
-    echo "   🔌 Hysteria2 监听端口: $SERVER_PORT"
-    echo "   🔑 Hysteria2 连接密码: $AUTH_PASSWORD"
+    echo "   🔌 Hysteria2 将部署 ${#NODE_PORTS[@]} 个节点，端口: ${NODE_PORTS[*]}"
     echo "   🌐 伪装 SNI: $SNI"
     echo "   🧩 ALPN: $ALPN"
     if [ "$USE_SOCKS5" = "y" ]; then
@@ -534,54 +483,51 @@ print_summary() {
 }
 
 uninstall_files() {
-    local file
-
-    echo "🗑️  开始卸载 Hysteria2 相关文件..."
-    if [ -f "$PID_FILE" ]; then
-        kill "$(cat "$PID_FILE")" 2>/dev/null || true
-        rm -f -- "$PID_FILE"
-    fi
-    pkill -f "hysteria-linux-.* server -c server.yaml" 2>/dev/null || true
-
-    while IFS= read -r file; do
-        if [ -e "$file" ]; then
-            rm -f -- "$file"
-            echo "✅ 已删除: $file"
-        fi
-    done < <(list_generated_files)
-
-    echo "✅ 卸载完成。"
+    echo "🗑️  开始清理旧的 Hysteria2 相关文件和进程..."
+    
+    # 杀掉所有以特定 yaml 结尾的 Hysteria2 进程
+    pkill -f "server -c server_.*\.yaml" 2>/dev/null || true
+    
+    rm -f hysteria_*.pid
+    rm -f hysteria_*.log
+    rm -f server_*.yaml
+    rm -f "${CERT_FILE}" "${KEY_FILE}" hysteria-linux-amd64 hysteria-linux-arm64
+    
+    echo "✅ 卸载/清理完成。"
 }
 
 start_hysteria() {
-    if [ -f "$PID_FILE" ]; then
-        local old_pid
-        old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-            echo "⚠️  检测到已有 Hysteria2 正在运行，先停止旧进程: $old_pid"
-            kill "$old_pid" 2>/dev/null || true
-            sleep 1
+    for i in "${!NODE_PORTS[@]}"; do
+        local port="${NODE_PORTS[$i]}"
+        local pid_file="hysteria_${port}.pid"
+        local log_file="hysteria_${port}.log"
+        local conf_file="server_${port}.yaml"
+
+        # 如果已有同端口进程在跑，先杀掉
+        if [ -f "$pid_file" ]; then
+            local old_pid
+            old_pid="$(cat "$pid_file" 2>/dev/null || true)"
+            if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+                kill "$old_pid" 2>/dev/null || true
+                sleep 1
+            fi
+            rm -f -- "$pid_file"
         fi
-        rm -f -- "$PID_FILE"
-    fi
 
-    echo "🚀 正在后台启动 Hysteria2..."
-    nohup "$BIN_PATH" server -c server.yaml >"$LOG_FILE" 2>&1 &
-    echo $! > "$PID_FILE"
-    sleep 1
+        echo "🚀 正在后台启动 Hysteria2 (端口: $port)..."
+        nohup "$BIN_PATH" server -c "$conf_file" >"$log_file" 2>&1 &
+        echo $! > "$pid_file"
+        sleep 1
 
-    if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo "✅ Hysteria2 已后台运行"
-        echo "   PID: $(cat "$PID_FILE")"
-        echo "   日志: $(pwd)/${LOG_FILE}"
-    else
-        echo "❌ Hysteria2 启动失败，请检查日志: $(pwd)/${LOG_FILE}"
-        exit 1
-    fi
+        if kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+            echo "✅ 节点 $port 已后台运行 (PID: $(cat "$pid_file"))"
+        else
+            echo "❌ 节点 $port 启动失败，请检查日志: $(pwd)/${log_file}"
+        fi
+    done
 }
 
 # ---------- 检测架构 ----------
-# 自动检测当前服务器的 CPU 架构，以决定下载哪个版本的内核
 arch_name() {
     local machine
     machine=$(uname -m | tr '[:upper:]' '[:lower:]')
@@ -634,15 +580,19 @@ ensure_cert() {
     ensure_openssl
     echo "🔑 未发现证书，使用 openssl 生成自签证书（prime256v1）..."
     openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-        -days 3650 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=${SNI}"
+        -days 3650 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=${SNI}" >/dev/null 2>&1
     echo "✅ 证书生成成功。"
 }
 
 # ---------- 写配置文件 ----------
 write_config() {
+    local port="$1"
+    local password="$2"
+    local conf_file="server_${port}.yaml"
+
     {
         cat <<EOF
-listen: ":${SERVER_PORT}"
+listen: ":${port}"
 tls:
   cert: "$(pwd)/${CERT_FILE}"
   key: "$(pwd)/${KEY_FILE}"
@@ -650,7 +600,7 @@ tls:
     - "${ALPN}"
 auth:
   type: "password"
-  password: "${AUTH_PASSWORD}"
+  password: "${password}"
 bandwidth:
   up: "${UP_BANDWIDTH}"
   down: "${DOWN_BANDWIDTH}"
@@ -711,9 +661,9 @@ acl:
     - direct(all)
 EOF
         fi
-    } > server.yaml
+    } > "$conf_file"
 
-    echo "✅ 写入配置 server.yaml 成功。"
+    echo "✅ 写入配置 $conf_file 成功。"
 }
 
 # ---------- 获取服务器 IP ----------
@@ -727,43 +677,27 @@ get_server_ip() {
 print_connection_info() {
     local ip="$1"
 
-    echo "🎉 Hysteria2 部署成功！"
+    echo "🎉 Hysteria2 多节点部署成功！"
     echo "=========================================================================="
     echo "📋 服务器信息:"
     echo "   🌐 服务器公网IP: $ip"
-    echo "   🔌 Hysteria2 监听端口: $SERVER_PORT"
-    echo "   🔑 Hysteria2 连接密码: $AUTH_PASSWORD"
     if [ "$USE_SOCKS5" = "y" ]; then
         echo "   🧦 $(socks_proxy_text)"
-        if [ -n "$SOCKS5_USER" ] && [ -n "$SOCKS5_PASS" ]; then
-            echo "   🔐 SOCKS5 认证: 已启用"
-        else
-            echo "   🔓 SOCKS5 认证: 未启用"
-        fi
         echo "   🚦 分流模式: $(mode_text)"
     else
         echo "   🧦 SOCKS5 代理: 未使用"
-        echo "   🚦 分流模式: 全部直连当前服务器"
     fi
     echo ""
-    echo "📱 节点链接（SNI=${SNI}, ALPN=${ALPN}, 跳过证书验证）:"
-    echo "hysteria2://${AUTH_PASSWORD}@${ip}:${SERVER_PORT}?sni=${SNI}&alpn=${ALPN}&insecure=1#Hy2-SOCKS5"
-    echo ""
-    echo "📝 运行文件:"
-    echo "   📄 配置文件: $(pwd)/server.yaml"
-    echo "   📄 日志文件: $(pwd)/${LOG_FILE}"
-    echo "   📄 PID 文件: $(pwd)/${PID_FILE}"
-    echo ""
-    if [ "$USE_SOCKS5" = "y" ]; then
-        echo "⚠️ 提醒："
-        echo "   1. 已启用 SOCKS5 代理，实际出口取决于该 SOCKS5 代理。"
-        echo "   2. 想换出口 IP，请切换代理背后的出口节点，或更换 SOCKS5 代理地址。"
-        if [ "$MODE" = "all_proxy" ]; then
-            echo "   3. 当前为尽量全代理模式，UDP 是否稳定取决于 SOCKS5 代理对 UDP 的支持。"
-        else
-            echo "   3. 当前为 TCP 代理 / UDP 直连模式，稳定性更好。"
-        fi
-    fi
+    echo "📱 节点链接（复制到 V2rayN / Clash Meta / Nekobox 中使用）:"
+    
+    for i in "${!NODE_PORTS[@]}"; do
+        local port="${NODE_PORTS[$i]}"
+        local pass="${NODE_PASSWORDS[$i]}"
+        echo "------------------------------------------------------"
+        echo "   🚀 节点 $((i+1)) (端口 $port)"
+        echo "   hysteria2://${pass}@${ip}:${port}?sni=${SNI}&alpn=${ALPN}&insecure=1#Hy2-${port}"
+    done
+
     echo "=========================================================================="
 }
 
@@ -788,7 +722,15 @@ main() {
     validate_config
     download_binary
     ensure_cert
-    write_config
+    
+    # 清理可能存在的旧单节点配置
+    pkill -f "hysteria-linux-.* server -c server.yaml" 2>/dev/null || true
+
+    # 循环写入配置并启动
+    for i in "${!NODE_PORTS[@]}"; do
+        write_config "${NODE_PORTS[$i]}" "${NODE_PASSWORDS[$i]}"
+    done
+    
     start_hysteria
     SERVER_IP="$(get_server_ip)"
     print_connection_info "$SERVER_IP"
