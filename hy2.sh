@@ -4,7 +4,7 @@
 
 # ==========================================
 # 请将这里的 URL 替换为你自己托管该脚本的真实直链（例如 Github Raw 链接）
-UPDATE_URL="https://raw.githubusercontent.com/你的用户名/你的仓库/main/hy2.sh"
+UPDATE_URL="https://raw.githubusercontent.com/gaathub/tuic-hy2-node.js-python/refs/heads/main/hy2.sh"
 # ==========================================
 
 # 默认全局配置
