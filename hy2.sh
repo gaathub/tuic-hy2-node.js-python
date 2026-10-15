@@ -1,48 +1,35 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# Hysteria2 多节点部署脚本（支持每个节点独立自定义 SOCKS5 代理）
-
-set -euo pipefail
+# Hysteria2 多节点部署脚本 (交互式菜单版 + 节点独立代理支持)
 
 # ==========================================
-# ---------- 核心多节点配置区 ----------
-# 注意：以下所有数组的元素个数必须完全一致（一一对应）
+# 请将这里的 URL 替换为你自己托管该脚本的真实直链（例如 Github Raw 链接）
+UPDATE_URL="https://raw.githubusercontent.com/你的用户名/你的仓库/main/hy2.sh"
 # ==========================================
 
-# 1. 节点基础配置
-NODE_PORTS=(22222 33333 44444)
-NODE_PASSWORDS=("ieshare2025" "ieshare2025" "ieshare2025")
-
-# 2. 节点独立的 SOCKS5 代理配置
-# 是否使用代理: y 表示使用，n 表示直连
-NODE_USE_SOCKS=("n" "y" "y")
-# 代理 IP: 如果不用代理填 ""，本机填 "127.0.0.1"
-NODE_SOCKS_IPS=("" "127.0.0.1" "198.51.100.1")
-# 代理端口: 如果不用代理填 ""
-NODE_SOCKS_PORTS=("" "7928" "1080")
-# 代理账号: 没有则填 ""
-NODE_SOCKS_USERS=("" "" "myuser")
-# 代理密码: 没有则填 ""
-NODE_SOCKS_PASSWORDS=("" "" "mypass")
-# 代理模式: tcp_only (仅TCP代理) 或 all_proxy (TCP/UDP全代理)
-NODE_SOCKS_MODES=("tcp_only" "tcp_only" "all_proxy")
-
-# ==========================================
-# ---------- 默认全局配置 ----------
+# 默认全局配置
 HYSTERIA_VERSION="${HYSTERIA_VERSION:-v2.6.5}"
-CERT_FILE="${CERT_FILE:-cert.pem}"             
-KEY_FILE="${KEY_FILE:-key.pem}"                
-SNI="${SNI:-www.bing.com}"                     
-ALPN="${ALPN:-h3}"
-UP_BANDWIDTH="${UP_BANDWIDTH:-200mbps}"
-DOWN_BANDWIDTH="${DOWN_BANDWIDTH:-200mbps}"
-ACTION="install"
-BIN_PATH=""
-# ==========================================
+CERT_FILE="cert.pem"             
+KEY_FILE="key.pem"                
+SNI="www.bing.com"                     
+ALPN="h3"
+UP_BANDWIDTH="200mbps"
+DOWN_BANDWIDTH="200mbps"
+BIN_PATH="./hysteria-linux-amd64" # 默认先占位，后续动态检测
 
-echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-echo "Hysteria2 多节点部署脚本（支持节点独立 SOCKS5 代理）"
-echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+# 动态配置数组 (交互式收录)
+NODE_PORTS=()
+NODE_PASSWORDS=()
+NODE_USE_SOCKS=()
+NODE_SOCKS_IPS=()
+NODE_SOCKS_PORTS=()
+NODE_SOCKS_USERS=()
+NODE_SOCKS_PASSWORDS=()
+NODE_SOCKS_MODES=()
+
+echo "======================================================"
+echo "  Hysteria2 多节点部署管理脚本 (支持节点独立 SOCKS5)"
+echo "======================================================"
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -59,10 +46,8 @@ install_openssl() {
     elif has_cmd dnf; then pkg_manager="dnf"
     elif has_cmd yum; then pkg_manager="yum"
     elif has_cmd apk; then pkg_manager="apk"
-    else
-        echo "❌ 未找到支持的包管理器，无法自动安装 openssl。"
-        exit 1
-    fi
+    else echo "❌ 未找到支持的包管理器，无法自动安装 openssl。"; exit 1; fi
+    
     ensure_root
     echo "📦 正在自动安装 openssl..."
     if [ "$pkg_manager" = "apt-get" ]; then
@@ -76,29 +61,22 @@ install_openssl() {
 
 ensure_openssl() { has_cmd openssl || install_openssl; }
 
-validate_port() {
-    local port="$1"
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        return 1
-    fi
-    return 0
-}
-
-validate_config() {
-    local count=${#NODE_PORTS[@]}
-    if [ ${#NODE_PASSWORDS[@]} -ne $count ] || [ ${#NODE_USE_SOCKS[@]} -ne $count ] || [ ${#NODE_SOCKS_IPS[@]} -ne $count ] || [ ${#NODE_SOCKS_PORTS[@]} -ne $count ]; then
-        echo "❌ 配置错误: 顶部的各个数组元素数量不一致，请检查是否一一对应！"
+# 在线更新脚本
+update_script() {
+    echo "🔄 正在从远程获取最新脚本..."
+    if curl -sSL -o hy2_update.sh "$UPDATE_URL"; then
+        mv hy2_update.sh hy2.sh
+        chmod +x hy2.sh
+        echo "✅ 脚本更新成功！请重新运行 bash hy2.sh"
+        exit 0
+    else
+        echo "❌ 更新失败！请检查 UPDATE_URL 是否正确或网络是否畅通。"
+        rm -f hy2_update.sh
         exit 1
     fi
-
-    for port in "${NODE_PORTS[@]}"; do
-        if ! validate_port "$port"; then
-            echo "❌ Hysteria2 监听端口无效: $port"
-            exit 1
-        fi
-    done
 }
 
+# 卸载清理
 uninstall_files() {
     echo "🗑️  开始清理旧的 Hysteria2 相关文件和进程..."
     pkill -f "server -c server_.*\.yaml" 2>/dev/null || true
@@ -107,31 +85,64 @@ uninstall_files() {
     echo "✅ 卸载/清理完成。"
 }
 
-start_hysteria() {
-    for i in "${!NODE_PORTS[@]}"; do
-        local port="${NODE_PORTS[$i]}"
-        local pid_file="hysteria_${port}.pid"
-        local log_file="hysteria_${port}.log"
-        local conf_file="server_${port}.yaml"
+# 交互式配置收集
+interactive_config() {
+    echo ""
+    read -p "请输入你想部署的节点总数 (例如 3): " node_count
+    if ! [[ "$node_count" =~ ^[0-9]+$ ]] || [ "$node_count" -le 0 ]; then
+        echo "❌ 节点数必须是大于 0 的数字！"
+        exit 1
+    fi
 
-        if [ -f "$pid_file" ]; then
-            local old_pid="$(cat "$pid_file" 2>/dev/null || true)"
-            if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-                kill "$old_pid" 2>/dev/null || true
-                sleep 1
+    for (( i=1; i<=node_count; i++ )); do
+        echo "------------------------------------------------------"
+        echo "📡 正在配置第 $i 个节点"
+        
+        # 1. 端口
+        while true; do
+            read -p "👉 监听端口 (1-65535): " port
+            if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then break; fi
+            echo "⚠️ 端口无效，请重新输入"
+        done
+        NODE_PORTS+=("$port")
+
+        # 2. 密码
+        read -p "👉 连接密码 [回车默认: ieshare2025]: " pwd
+        NODE_PASSWORDS+=("${pwd:-ieshare2025}")
+
+        # 3. 代理设置
+        read -p "👉 是否套 SOCKS5 代理? (y/n) [回车默认: n]: " use_socks
+        use_socks=${use_socks:-n}
+        
+        if [[ "${use_socks,,}" == "y" ]]; then
+            NODE_USE_SOCKS+=("y")
+            
+            read -p "   - 代理 IP (本机代理填 127.0.0.1): " s_ip
+            NODE_SOCKS_IPS+=("${s_ip}")
+            
+            read -p "   - 代理端口: " s_port
+            NODE_SOCKS_PORTS+=("${s_port}")
+            
+            read -p "   - 代理账号 (没有直接回车): " s_user
+            NODE_SOCKS_USERS+=("${s_user}")
+            
+            read -p "   - 代理密码 (没有直接回车): " s_pass
+            NODE_SOCKS_PASSWORDS+=("${s_pass}")
+            
+            echo "   - 代理模式: 1) 仅TCP代理(推荐)  2) TCP/UDP全代理"
+            read -p "   请输入选择 [回车默认: 1]: " s_mode
+            if [ "$s_mode" = "2" ]; then
+                NODE_SOCKS_MODES+=("all_proxy")
+            else
+                NODE_SOCKS_MODES+=("tcp_only")
             fi
-            rm -f -- "$pid_file"
-        fi
-
-        echo "🚀 正在后台启动节点 (端口: $port)..."
-        nohup "$BIN_PATH" server -c "$conf_file" >"$log_file" 2>&1 &
-        echo $! > "$pid_file"
-        sleep 1
-
-        if kill -0 "$(cat "$pid_file")" 2>/dev/null; then
-            echo "✅ 节点 $port 已后台运行 (PID: $(cat "$pid_file"))"
         else
-            echo "❌ 节点 $port 启动失败，请检查日志: $(pwd)/${log_file}"
+            NODE_USE_SOCKS+=("n")
+            NODE_SOCKS_IPS+=("")
+            NODE_SOCKS_PORTS+=("")
+            NODE_SOCKS_USERS+=("")
+            NODE_SOCKS_PASSWORDS+=("")
+            NODE_SOCKS_MODES+=("")
         fi
     done
 }
@@ -148,9 +159,9 @@ download_binary() {
     local arch="$(arch_name)"
     if [ -z "$arch" ]; then echo "❌ 无法识别 CPU 架构。"; exit 1; fi
     BIN_PATH="./hysteria-linux-${arch}"
-    if [ -f "$BIN_PATH" ]; then echo "✅ 二进制已存在，跳过下载。"; return; fi
+    if [ -f "$BIN_PATH" ]; then echo "✅ 二进制核心已存在，跳过下载。"; return; fi
     local url="https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/hysteria-linux-${arch}"
-    echo "⏳ 下载核心组件..."
+    echo "⏳ 正在下载 Hysteria2 核心组件..."
     curl -L --retry 3 --connect-timeout 30 -o "$BIN_PATH" "$url"
     chmod +x "$BIN_PATH"
 }
@@ -230,33 +241,39 @@ acl:
 EOF
         fi
     } > "$conf_file"
-    echo "✅ 写入配置 $conf_file 成功 (SOCKS代理: ${use_socks})。"
 }
 
-get_server_ip() {
-    curl --max-time 10 https://api.ipify.org 2>/dev/null || echo "127.0.0.1"
-}
-
-main() {
-    if [[ "${1:-}" == "del" ]] || [[ "${1:-}" == "--uninstall" ]]; then
-        uninstall_files
-        exit 0
-    fi
-
-    validate_config
+start_nodes() {
     download_binary
     ensure_cert
+    # 杀掉旧的 Hysteria 进程避免端口占用
     pkill -f "server -c server_.*\.yaml" 2>/dev/null || true
 
+    echo "======================================================"
     for i in "${!NODE_PORTS[@]}"; do
+        local port="${NODE_PORTS[$i]}"
+        local pid_file="hysteria_${port}.pid"
+        local log_file="hysteria_${port}.log"
+        local conf_file="server_${port}.yaml"
+
         write_config "${NODE_PORTS[$i]}" "${NODE_PASSWORDS[$i]}" "${NODE_USE_SOCKS[$i]}" "${NODE_SOCKS_IPS[$i]}" "${NODE_SOCKS_PORTS[$i]}" "${NODE_SOCKS_USERS[$i]}" "${NODE_SOCKS_PASSWORDS[$i]}" "${NODE_SOCKS_MODES[$i]}"
+        
+        nohup "$BIN_PATH" server -c "$conf_file" >"$log_file" 2>&1 &
+        echo $! > "$pid_file"
+        sleep 1
+
+        if kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+            echo "✅ 节点 $port 已启动"
+        else
+            echo "❌ 节点 $port 启动失败"
+        fi
     done
-    
-    start_hysteria
-    SERVER_IP="$(get_server_ip)"
-    
-    echo "=========================================================================="
-    echo "🎉 多节点部署完毕！"
+}
+
+show_links() {
+    local ip=$(curl -s --max-time 10 https://api.ipify.org || echo "127.0.0.1")
+    echo "======================================================"
+    echo "🎉 部署完毕！分享链接如下："
     for i in "${!NODE_PORTS[@]}"; do
         echo "------------------------------------------------------"
         echo "🚀 节点 $((i+1)) (端口: ${NODE_PORTS[$i]})"
@@ -265,9 +282,32 @@ main() {
         else
             echo "   🔗 代理状态: 服务器直连"
         fi
-        echo "   👉 订阅链接: hysteria2://${NODE_PASSWORDS[$i]}@${SERVER_IP}:${NODE_PORTS[$i]}?sni=${SNI}&alpn=${ALPN}&insecure=1#Hy2-Node-$((i+1))"
+        echo "   👉 订阅链接: hysteria2://${NODE_PASSWORDS[$i]}@${ip}:${NODE_PORTS[$i]}?sni=${SNI}&alpn=${ALPN}&insecure=1#Hy2-Node-$((i+1))"
     done
-    echo "=========================================================================="
+    echo "======================================================"
 }
 
-main "$@"
+# ================= 主菜单 =================
+echo "1. 交互式部署多节点 (支持各自独立代理)"
+echo "2. 卸载并清理所有节点"
+echo "3. 在线更新本脚本"
+echo "0. 退出"
+read -p "请选择数字 [0-3]: " choice
+
+case $choice in
+    1)
+        interactive_config
+        start_nodes
+        show_links
+        ;;
+    2)
+        uninstall_files
+        ;;
+    3)
+        update_script
+        ;;
+    0|*)
+        echo "已退出。"
+        exit 0
+        ;;
+esac
