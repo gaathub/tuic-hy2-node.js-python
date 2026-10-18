@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# Hysteria2 多节点部署脚本 (交互式菜单版 + 节点独立代理支持)
+# Hysteria2 多节点部署脚本 (交互式菜单版 + 节点独立代理支持 + 自动获取最新内核)
 
 # ==========================================
 # 请将这里的 URL 替换为你自己托管该脚本的真实直链（例如 Github Raw 链接）
 UPDATE_URL="https://raw.githubusercontent.com/gaathub/tuic-hy2-node.js-python/refs/heads/main/hy2.sh"
 # ==========================================
 
-# 默认全局配置
-HYSTERIA_VERSION="${HYSTERIA_VERSION:-v2.6.5}"
+# 默认全局配置 (去除了写死的版本号)
 CERT_FILE="cert.pem"             
 KEY_FILE="key.pem"                
 SNI="www.bing.com"                     
 ALPN="h3"
 UP_BANDWIDTH="200mbps"
 DOWN_BANDWIDTH="200mbps"
-BIN_PATH="./hysteria-linux-amd64" # 默认先占位，后续动态检测
+BIN_PATH="" # 留空，后续由下载模块动态赋值为最新版路径
 
 # 动态配置数组 (交互式收录)
 NODE_PORTS=()
@@ -81,7 +80,7 @@ uninstall_files() {
     echo "🗑️  开始清理旧的 Hysteria2 相关文件和进程..."
     pkill -f "server -c server_.*\.yaml" 2>/dev/null || true
     rm -f hysteria_*.pid hysteria_*.log server_*.yaml
-    rm -f "${CERT_FILE}" "${KEY_FILE}" hysteria-linux-amd64 hysteria-linux-arm64
+    rm -f "${CERT_FILE}" "${KEY_FILE}" hysteria-linux-*
     echo "✅ 卸载/清理完成。"
 }
 
@@ -158,10 +157,33 @@ download_binary() {
     if ! has_cmd curl; then echo "❌ 未检测到 curl，请先安装。"; exit 1; fi
     local arch="$(arch_name)"
     if [ -z "$arch" ]; then echo "❌ 无法识别 CPU 架构。"; exit 1; fi
-    BIN_PATH="./hysteria-linux-${arch}"
-    if [ -f "$BIN_PATH" ]; then echo "✅ 二进制核心已存在，跳过下载。"; return; fi
-    local url="https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/hysteria-linux-${arch}"
-    echo "⏳ 正在下载 Hysteria2 核心组件..."
+    
+    echo "🔄 正在从 GitHub 抓取 Hysteria2 最新版本号..."
+    # 调用 GitHub API 获取最新 tag
+    local latest_version=$(curl -s "https://api.github.com/repos/apernet/hysteria/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    
+    # 兜底机制：如果服务器网络限制导致获取失败，则回退到稳定版本
+    if [ -z "$latest_version" ]; then
+        latest_version="v2.6.5"
+        echo "⚠️ 获取最新版本失败，自动回退至兜底版本: $latest_version"
+    else
+        echo "✅ 成功获取最新版本: $latest_version"
+    fi
+
+    # 将版本号写进文件名，用于检测是否需要更新
+    BIN_PATH="./hysteria-linux-${arch}-${latest_version}"
+
+    if [ -f "$BIN_PATH" ]; then
+        echo "✅ 当前已是最新版内核 ($latest_version)，跳过下载。"
+        return
+    fi
+
+    # 如果运行到这里，说明本地没有最新版核心，清理所有旧版本核心腾出空间
+    echo "🧹 清理旧版内核..."
+    rm -f ./hysteria-linux-*
+
+    local url="https://github.com/apernet/hysteria/releases/download/app/${latest_version}/hysteria-linux-${arch}"
+    echo "⏳ 正在下载 Hysteria2 最新核心 ($latest_version)..."
     curl -L --retry 3 --connect-timeout 30 -o "$BIN_PATH" "$url"
     chmod +x "$BIN_PATH"
 }
