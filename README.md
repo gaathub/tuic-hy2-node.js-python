@@ -1,5 +1,3 @@
-# 1.Hysteria2在Nodejs/Python一键脚本极简部署（Pterodactyl 翼龙面板）
-
 * 更新自适应端口，无需再手动设置
 
 * Hysteria2版本：2.6.5 官方更新说明（原文直译）：
@@ -8,11 +6,11 @@
   
 * 安装脚本
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy2.sh | sed 's/\r$//')
+bash <(curl -Ls https://raw.githubusercontent.com/gaathub/tuic-hy2-node.js-python/refs/heads/main/hy2.sh | sed 's/\r$//')
 ```
 * 卸载脚本
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy2.sh | sed 's/\r$//') del
+bash <(curl -Ls https://raw.githubusercontent.com/gaathub/tuic-hy2-node.js-python/refs/heads/main/hy2.sh | sed 's/\r$//') del
 ```
 
 
