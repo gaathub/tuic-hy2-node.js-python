@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 基于 sing-box 的 TUIC 多节点管理脚本
 # 功能：多个 TUIC 节点共用一个 UUID 和证书；每个节点独立端口、SOCKS5 代理路由、日志和 PID。
-# 新增：动态检测 IPv4/IPv6 栈，防止因禁用 IPv6 导致的内核崩溃。
+# 更新：密码与 UUID 强行保持一致，修复旧版文件读取导致的空密码问题；动态检测 IP 栈。
 
 set -Eeuo pipefail
 umask 077
@@ -142,22 +142,27 @@ generate_uuid() {
 }
 
 ensure_auth() {
-    local saved_uuid="" saved_pass=""
+    local saved_uuid=""
     mkdir -p "$BASE_DIR"
     if [[ -f "$AUTH_FILE" ]]; then
-        { read -r saved_uuid; read -r saved_pass; } < "$AUTH_FILE" || true
+        IFS= read -r saved_uuid < "$AUTH_FILE" || true
     fi
-    if [[ "$saved_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ && -n "$saved_pass" ]]; then
+    
+    # 清理读取到的字符串，防止带有换行或回车符
+    saved_uuid="$(echo "$saved_uuid" | tr -d '\r ')"
+    
+    if [[ "$saved_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
         AUTH_UUID="${saved_uuid,,}"
-        AUTH_PASS="$saved_pass"
+        AUTH_PASS="$AUTH_UUID" # 强制密码等于 UUID
         chmod 600 "$AUTH_FILE" 2>/dev/null || true
         return 0
     fi
+    
     AUTH_UUID="$(generate_uuid)"
-    AUTH_PASS="$(openssl rand -hex 16)"
-    printf '%s\n%s\n' "$AUTH_UUID" "$AUTH_PASS" > "$AUTH_FILE"
+    AUTH_PASS="$AUTH_UUID"
+    printf '%s\n' "$AUTH_UUID" > "$AUTH_FILE"
     chmod 600 "$AUTH_FILE"
-    echo "✅ 已生成公共 UUID 及密码。"
+    echo "✅ 已生成公共 UUID (密码与 UUID 相同)。"
 }
 
 ensure_binary() {
@@ -275,11 +280,11 @@ write_node_config() {
     if ip -6 addr | grep -q 'inet6 '; then has_v6=1; fi
     
     if [[ $has_v4 -eq 1 && $has_v6 -eq 1 ]]; then
-        listen_addr="::" # 存在双栈，使用 :: 同时监听 v4 和 v6
+        listen_addr="::" 
     elif [[ $has_v4 -eq 1 ]]; then
-        listen_addr="0.0.0.0" # 仅有 v4
+        listen_addr="0.0.0.0" 
     elif [[ $has_v6 -eq 1 ]]; then
-        listen_addr="::" # 仅有 v6
+        listen_addr="::" 
     fi
     
     # 构建基础的出站配置
@@ -352,6 +357,7 @@ get_server_ip() {
 print_link() {
     local ip="$1" url_ip="$1" label="$2"
     if [[ "$url_ip" == *:* && "$url_ip" != \[*\] ]]; then url_ip="[$url_ip]"; fi
+    # 链接格式: tuic://uuid:password@ip:port
     printf 'tuic://%s:%s@%s:%s?congestion_control=bbr&alpn=%s&allowInsecure=1&sni=%s#TUIC-%s\n' \
         "$AUTH_UUID" "$AUTH_PASS" "$url_ip" "$NODE_PORT" "$ALPN" "$SNI" "$label"
 }
@@ -437,7 +443,9 @@ start_node() {
         return 0
     fi
     if [[ ! -f "$NODE_DIR/config.json" ]]; then
-        { read -r AUTH_UUID; read -r AUTH_PASS; } < "$AUTH_FILE"
+        IFS= read -r AUTH_UUID < "$AUTH_FILE"
+        AUTH_UUID="$(echo "$AUTH_UUID" | tr -d '\r ')"
+        AUTH_PASS="$AUTH_UUID"
         write_node_config
     fi
     echo "🚀 启动节点 $NODE_NAME（端口 $NODE_PORT）..."
@@ -509,7 +517,7 @@ show_logs() {
 
 show_auth() {
     ensure_auth
-    echo -e "UUID: $AUTH_UUID\n密码: $AUTH_PASS"
+    echo -e "UUID: $AUTH_UUID\n密码: $AUTH_PASS (与 UUID 相同)"
 }
 
 menu() {
