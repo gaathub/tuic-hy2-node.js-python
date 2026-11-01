@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 基于 sing-box 的 TUIC 多节点管理脚本
-# 功能：多个 TUIC 节点共用一个 UUID 和证书；每个节点独立端口、SOCKS5 代理路由、日志和 PID。
-# 更新：密码与 UUID 强行保持一致，修复旧版文件读取导致的空密码问题；动态检测 IP 栈。
+# 功能：多个 TUIC 节点共用一个 UUID 和证书；每个节点独立端口、SOCKS5 代理路由。
+# 更新：深度参考 argosbx 补充了 UDP Relay Native 模式及客户端防失联参数。
 
 set -Eeuo pipefail
 umask 077
@@ -39,7 +39,6 @@ PROXY_MODE="all_proxy"
 AUTH_UUID=""
 AUTH_PASS=""
 
-# -------------------- 通用小工具 --------------------
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 ensure_root() {
@@ -96,7 +95,6 @@ valid_node_name() {
     [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$ ]]
 }
 
-# -------------------- 系统依赖、鉴权、二进制和证书 --------------------
 install_missing_dependencies() {
     local missing=()
     has_cmd curl || missing+=(curl)
@@ -147,17 +145,13 @@ ensure_auth() {
     if [[ -f "$AUTH_FILE" ]]; then
         IFS= read -r saved_uuid < "$AUTH_FILE" || true
     fi
-    
-    # 清理读取到的字符串，防止带有换行或回车符
     saved_uuid="$(echo "$saved_uuid" | tr -d '\r ')"
-    
     if [[ "$saved_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
         AUTH_UUID="${saved_uuid,,}"
-        AUTH_PASS="$AUTH_UUID" # 强制密码等于 UUID
+        AUTH_PASS="$AUTH_UUID" 
         chmod 600 "$AUTH_FILE" 2>/dev/null || true
         return 0
     fi
-    
     AUTH_UUID="$(generate_uuid)"
     AUTH_PASS="$AUTH_UUID"
     printf '%s\n' "$AUTH_UUID" > "$AUTH_FILE"
@@ -206,7 +200,6 @@ ensure_common_files() {
     ensure_certificate
 }
 
-# -------------------- 节点配置文件 (JSON 格式) --------------------
 save_node_meta() {
     local file="$NODE_DIR/node.conf"
     mkdir -p "$NODE_DIR"
@@ -271,23 +264,12 @@ write_node_config() {
     local json_file="$NODE_DIR/config.json"
     mkdir -p "$NODE_DIR"
     
-    # 检测 IPv4 和 IPv6 栈支持情况
     local listen_addr="0.0.0.0"
-    local has_v4=0
-    local has_v6=0
-    
+    local has_v4=0; local has_v6=0
     if ip -4 addr | grep -q 'inet '; then has_v4=1; fi
     if ip -6 addr | grep -q 'inet6 '; then has_v6=1; fi
+    if [[ $has_v4 -eq 1 && $has_v6 -eq 1 ]]; then listen_addr="::"; elif [[ $has_v6 -eq 1 ]]; then listen_addr="::"; fi
     
-    if [[ $has_v4 -eq 1 && $has_v6 -eq 1 ]]; then
-        listen_addr="::" 
-    elif [[ $has_v4 -eq 1 ]]; then
-        listen_addr="0.0.0.0" 
-    elif [[ $has_v6 -eq 1 ]]; then
-        listen_addr="::" 
-    fi
-    
-    # 构建基础的出站配置
     local outbounds_json='[{"type": "direct", "tag": "direct"}]'
     local route_json='{"rules": []}'
 
@@ -300,18 +282,14 @@ write_node_config() {
             {\"type\": \"socks\", \"tag\": \"socks-out\", \"server\": \"$SOCKS_HOST\", \"server_port\": $SOCKS_PORT $auth_block},
             {\"type\": \"direct\", \"tag\": \"direct\"}
         ]"
-        
         if [[ "$PROXY_MODE" == "all_proxy" ]]; then
             route_json='{"rules": [{"inbound": ["tuic-in"], "outbound": "socks-out"}]}'
         else
-            route_json='{"rules": [
-                {"network": ["udp"], "outbound": "direct"},
-                {"inbound": ["tuic-in"], "outbound": "socks-out"}
-            ]}'
+            route_json='{"rules": [{"network": ["udp"], "outbound": "direct"}, {"inbound": ["tuic-in"], "outbound": "socks-out"}]}'
         fi
     fi
 
-    # 写入 JSON
+    # 深度参考 argosbx 补全参数
     cat > "$json_file" <<EOF
 {
   "log": {
@@ -331,8 +309,13 @@ write_node_config() {
         }
       ],
       "congestion_control": "bbr",
+      "udp_relay_mode": "native",
+      "udp_over_stream": false,
+      "zero_rtt_handshake": false,
+      "heartbeat": "10s",
       "tls": {
         "enabled": true,
+        "server_name": "${SNI}",
         "certificate_path": "${CERT_FILE}",
         "key_path": "${KEY_FILE}",
         "alpn": ["${ALPN}"]
@@ -346,7 +329,6 @@ EOF
     chmod 600 "$json_file"
 }
 
-# -------------------- 显示信息、节点生命周期 --------------------
 get_server_ip() {
     local ip=""
     ip="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
@@ -357,8 +339,8 @@ get_server_ip() {
 print_link() {
     local ip="$1" url_ip="$1" label="$2"
     if [[ "$url_ip" == *:* && "$url_ip" != \[*\] ]]; then url_ip="[$url_ip]"; fi
-    # 链接格式: tuic://uuid:password@ip:port
-    printf 'tuic://%s:%s@%s:%s?congestion_control=bbr&alpn=%s&allowInsecure=1&sni=%s#TUIC-%s\n' \
+    # 深度参考 argosbx 客户端适配：同时添加 insecure=1, allowInsecure=1, allow_insecure=1 解决客户端不识别问题
+    printf 'tuic://%s:%s@%s:%s?congestion_control=bbr&udp_relay_mode=native&alpn=%s&sni=%s&insecure=1&allowInsecure=1&allow_insecure=1#TUIC-%s\n' \
         "$AUTH_UUID" "$AUTH_PASS" "$url_ip" "$NODE_PORT" "$ALPN" "$SNI" "$label"
 }
 
@@ -411,7 +393,6 @@ create_node() {
             read_value "SOCKS5 用户名"; SOCKS_USER="$REPLY"
             read_secret "SOCKS5 密码"; SOCKS_PASS="$REPLY"
         fi
-
         echo -e "\n请选择代理分流模式："
         echo "1. 仅 TCP 走代理，UDP 直连"
         echo "2. TCP 和 UDP 都尽可能走 SOCKS5"
@@ -430,7 +411,7 @@ create_node() {
     
     server_ip="$(get_server_ip)"
     echo -e "\n🎉 节点创建完成！"
-    echo "节点链接 (客户端需允许不安全证书 insecure=1):"
+    echo "节点链接 (客户端需允许不安全证书):"
     print_link "$server_ip" "$NODE_NAME"
 }
 
