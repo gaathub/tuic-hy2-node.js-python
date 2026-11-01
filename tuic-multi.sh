@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
 # ==========================================================
-# TUIC Multi-Node Manager
+# TUIC Multi-Node Manager (Repaired Version)
 # 基于 sing-box
-# 支持多节点、SOCKS5、TCP/UDP、systemd、卸载
+# 修复：自动安装依赖(jq等)、适配翼龙面板(移除 systemd 改用 nohup)、兼容性提升
 # ==========================================================
 
 set -Eeuo pipefail
@@ -15,8 +15,7 @@ DATA_DIR="$BASE/data"
 LOG_DIR="$BASE/logs"
 GLOBAL="$DATA_DIR/global.env"
 
-BIN="/usr/bin/sing-box"
-SERVICE_PREFIX="tuic-node-"
+BIN="$BASE/sing-box"
 
 # ==========================================================
 # 基础函数
@@ -52,12 +51,27 @@ check_root() {
 }
 
 check_dependencies() {
-    for cmd in curl jq openssl systemctl; do
+    local missing=()
+    for cmd in curl jq openssl tar; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
-            error "缺少依赖：$cmd"
-            return 1
+            missing+=("$cmd")
         fi
     done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        info "正在自动安装缺失的依赖：${missing[*]}..."
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -y && apt-get install -y "${missing[@]}"
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y "${missing[@]}"
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache "${missing[@]}"
+        else
+            error "无法自动安装包，请手动安装: ${missing[*]}"
+            exit 1
+        fi
+        info "依赖安装完成。"
+    fi
 }
 
 # ==========================================================
@@ -73,11 +87,10 @@ init_dirs() {
 }
 
 # ==========================================================
-# 安装 sing-box
+# 安装 sing-box (通用二进制包)
 # ==========================================================
 
 install_singbox() {
-
     if [[ -x "$BIN" ]]; then
         info "检测到 sing-box 已安装"
         "$BIN" version
@@ -86,50 +99,32 @@ install_singbox() {
 
     info "正在安装 sing-box..."
 
-    local arch
-    arch="$(uname -m)"
-
+    local arch="$(uname -m)"
     case "$arch" in
-        x86_64)
-            arch="amd64"
-            ;;
-        aarch64|arm64)
-            arch="arm64"
-            ;;
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
         *)
             error "暂不支持该 CPU 架构：$arch"
             return 1
             ;;
     esac
 
-    local api
-    api="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
-
-    local url
-
-    url="$(
-        curl -fsSL "$api" |
-        jq -r --arg arch "$arch" '
-        [
-            .assets[].browser_download_url
-            | select(test("_linux_" + $arch + "\\.deb$"))
-        ][0] // empty
-        '
-    )"
-
-    if [[ -z "$url" ]]; then
-        error "无法获取 sing-box 安装包"
+    local SINGBOX_VERSION="1.10.1"
+    local release_file="sing-box-${SINGBOX_VERSION}-linux-${arch}"
+    local url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${release_file}.tar.gz"
+    local tmp_dir="/tmp/singbox_tmp"
+    
+    mkdir -p "$tmp_dir"
+    if ! curl -fL "$url" -o "$tmp_dir/sb.tar.gz"; then
+        error "下载 sing-box 失败"
+        rm -rf "$tmp_dir"
         return 1
     fi
-
-    local tmp="/tmp/sing-box.deb"
-
-    curl -fL "$url" -o "$tmp"
-
-    apt-get update
-    apt-get install -y "$tmp"
-
-    rm -f "$tmp"
+    
+    tar -xzf "$tmp_dir/sb.tar.gz" -C "$tmp_dir"
+    mv -f "$tmp_dir/${release_file}/sing-box" "$BIN"
+    chmod 755 "$BIN"
+    rm -rf "$tmp_dir"
 
     if [[ ! -x "$BIN" ]]; then
         error "sing-box 安装失败"
@@ -144,14 +139,12 @@ install_singbox() {
 # ==========================================================
 
 init_global() {
-
     if [[ -f "$GLOBAL" ]]; then
         source "$GLOBAL"
         return
     fi
 
-    UUID="$(cat /proc/sys/kernel/random/uuid)"
-
+    UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)"
     PASSWORD="$(openssl rand -hex 16)"
 
     cat > "$GLOBAL" <<EOF
@@ -160,7 +153,6 @@ PASSWORD='$PASSWORD'
 EOF
 
     chmod 600 "$GLOBAL"
-
     info "已生成全局 UUID 和密码"
 }
 
@@ -169,19 +161,14 @@ EOF
 # ==========================================================
 
 get_public_ip() {
-
     local ip
-
     ip="$(curl -4 -fsSL --max-time 8 https://api.ipify.org || true)"
-
     if [[ -z "$ip" ]]; then
         ip="$(curl -6 -fsSL --max-time 8 https://api64.ipify.org || true)"
     fi
-
     if [[ -z "$ip" ]]; then
         read -rp "请输入服务器公网 IP 或域名：" ip
     fi
-
     echo "$ip"
 }
 
@@ -190,32 +177,26 @@ get_public_ip() {
 # ==========================================================
 
 create_cert() {
-
-    if [[ -f "$CERT_DIR/server.crt" &&
-          -f "$CERT_DIR/server.key" ]]; then
+    if [[ -f "$CERT_DIR/server.crt" && -f "$CERT_DIR/server.key" ]]; then
         return
     fi
 
     local sni
-
     read -rp "请输入 TLS SNI（默认 www.bing.com）：" sni
-
     sni="${sni:-www.bing.com}"
 
     openssl req \
         -x509 \
         -nodes \
-        -newkey rsa:2048 \
+        -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -keyout "$CERT_DIR/server.key" \
         -out "$CERT_DIR/server.crt" \
         -days 3650 \
         -subj "/CN=$sni" \
-        -addext "subjectAltName=DNS:$sni"
+        -addext "subjectAltName=DNS:$sni" >/dev/null 2>&1
 
     chmod 600 "$CERT_DIR/server.key"
-
     echo "$sni" > "$DATA_DIR/sni"
-
     info "TLS 证书生成成功"
 }
 
@@ -224,7 +205,6 @@ create_cert() {
 # ==========================================================
 
 valid_name() {
-
     [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]
 }
 
@@ -233,7 +213,6 @@ valid_name() {
 # ==========================================================
 
 generate_config() {
-
     local name="$1"
     local port="$2"
     local mode="$3"
@@ -243,13 +222,10 @@ generate_config() {
     local password="${7:-}"
 
     local config="$NODE_DIR/$name/config.json"
-
     local outbound
 
     if [[ "$mode" == "socks" ]]; then
-
         if [[ -n "$username" ]]; then
-
             outbound="$(
                 jq -n \
                 --arg host "$host" \
@@ -266,9 +242,7 @@ generate_config() {
                     password: $pass
                 }'
             )"
-
         else
-
             outbound="$(
                 jq -n \
                 --arg host "$host" \
@@ -281,22 +255,20 @@ generate_config() {
                     version: "5"
                 }'
             )"
-
         fi
-
     else
-
         outbound='{"type":"direct","tag":"direct-out"}'
-
     fi
 
     local target
-
     if [[ "$mode" == "socks" ]]; then
         target="socks-out"
     else
         target="direct-out"
     fi
+
+    local sni
+    sni="$(cat "$DATA_DIR/sni")"
 
     jq -n \
         --arg uuid "$UUID" \
@@ -304,20 +276,19 @@ generate_config() {
         --argjson port "$port" \
         --arg target "$target" \
         --argjson outbound "$outbound" \
+        --arg sni "$sni" \
         '
         {
             log: {
                 level: "info",
                 timestamp: true
             },
-
             inbounds: [
                 {
                     type: "tuic",
                     tag: "tuic-in",
-                    listen: "::",
+                    listen: "0.0.0.0",
                     listen_port: $port,
-
                     users: [
                         {
                             name: "default",
@@ -325,20 +296,20 @@ generate_config() {
                             password: $pass
                         }
                     ],
-
                     congestion_control: "bbr",
+                    udp_relay_mode: "native",
                     auth_timeout: "3s",
                     zero_rtt_handshake: false,
                     heartbeat: "10s",
-
                     tls: {
                         enabled: true,
+                        server_name: $sni,
                         certificate_path: "/opt/tuic/cert/server.crt",
-                        key_path: "/opt/tuic/cert/server.key"
+                        key_path: "/opt/tuic/cert/server.key",
+                        alpn: ["h3"]
                     }
                 }
             ],
-
             outbounds: [
                 $outbound,
                 {
@@ -346,7 +317,6 @@ generate_config() {
                     tag: "direct-out"
                 }
             ],
-
             route: {
                 rules: [
                     {
@@ -355,61 +325,62 @@ generate_config() {
                         outbound: $target
                     }
                 ],
-
                 final: "direct-out"
             }
         }
         ' > "$config"
 
     chmod 600 "$config"
-
-    # 检查 sing-box 配置是否合法
     "$BIN" check -c "$config"
 }
 
 # ==========================================================
-# 创建 systemd 服务
+# 使用 nohup 管理进程 (替代 systemd)
 # ==========================================================
 
-create_service() {
-
+start_node() {
     local name="$1"
-
-    local service="${SERVICE_PREFIX}${name}.service"
-
     local config="$NODE_DIR/$name/config.json"
+    local pid_file="$NODE_DIR/$name/node.pid"
+    local log_file="$LOG_DIR/${name}.log"
 
-    cat > "/etc/systemd/system/$service" <<EOF
-[Unit]
-Description=TUIC Node $name
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=$BIN run -c $config
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-
-    systemctl enable "$service"
-
-    systemctl restart "$service"
-
-    sleep 1
-
-    if systemctl is-active --quiet "$service"; then
-        info "节点 $name 启动成功"
-    else
-        error "节点启动失败，请查看日志"
-        journalctl -u "$service" -n 30 --no-pager
+    if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+        info "节点 $name 已在运行中"
+        return
     fi
+
+    nohup "$BIN" run -c "$config" > "$log_file" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$pid_file"
+
+    sleep 2
+    if kill -0 "$pid" 2>/dev/null; then
+        info "节点 $name 启动成功 (PID: $pid)"
+    else
+        error "节点启动失败，请检查配置或端口冲突。查看日志：$log_file"
+        rm -f "$pid_file"
+    fi
+}
+
+stop_node() {
+    local name="$1"
+    local pid_file="$NODE_DIR/$name/node.pid"
+    
+    if [[ -f "$pid_file" ]]; then
+        local pid="$(cat "$pid_file")"
+        kill "$pid" 2>/dev/null || true
+        rm -f "$pid_file"
+        info "节点 $name 已停止"
+    else
+        info "节点 $name 未运行"
+    fi
+}
+
+restart_node() {
+    local name="$1"
+    stop_node "$name"
+    sleep 1
+    start_node "$name"
 }
 
 # ==========================================================
@@ -417,9 +388,7 @@ EOF
 # ==========================================================
 
 generate_link() {
-
     local name="$1"
-
     source "$NODE_DIR/$name/node.env"
 
     local ip
@@ -438,12 +407,10 @@ generate_link() {
     echo "=========================================="
     echo "节点名称：$name"
     echo "服务器地址：$ip"
-    echo "监听端口：$PORT"
+    echo "监听端口：$PORT/UDP"
     echo "SOCKS5：$MODE"
     echo "=========================================="
-
-    echo "tuic://$UUID:$PASSWORD@$ip:$PORT?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$encoded_sni&allow_insecure=1#$encoded_name"
-
+    echo "tuic://$UUID:$PASSWORD@$ip:$PORT?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$encoded_sni&allow_insecure=1&allowInsecure=1&insecure=1#$encoded_name"
     echo "=========================================="
 }
 
@@ -452,12 +419,10 @@ generate_link() {
 # ==========================================================
 
 create_node() {
-
     echo
     echo "========== 创建 TUIC 节点 =========="
 
     read -rp "节点名称：" name
-
     if ! valid_name "$name"; then
         error "节点名称只能使用英文、数字、下划线和横杠"
         return
@@ -469,15 +434,8 @@ create_node() {
     fi
 
     read -rp "监听端口：" port
-
-    if ! [[ "$port" =~ ^[0-9]+$ ]] ||
-       (( port < 1 || port > 65535 )); then
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
         error "端口不合法"
-        return
-    fi
-
-    if ss -lun | grep -qE ":${port}[[:space:]]"; then
-        error "UDP 端口已经被占用"
         return
     fi
 
@@ -485,7 +443,6 @@ create_node() {
     echo "请选择出站方式："
     echo "1. DIRECT 直接连接"
     echo "2. SOCKS5 代理"
-
     read -rp "选择：" choice
 
     local mode="direct"
@@ -495,15 +452,11 @@ create_node() {
     local password=""
 
     if [[ "$choice" == "2" ]]; then
-
         mode="socks"
-
         read -rp "SOCKS5 地址：" host
         read -rp "SOCKS5 端口：" socks_port
 
-        if [[ -z "$host" ]] ||
-           ! [[ "$socks_port" =~ ^[0-9]+$ ]] ||
-           (( socks_port < 1 || socks_port > 65535 )); then
+        if [[ -z "$host" ]] || ! [[ "$socks_port" =~ ^[0-9]+$ ]] || (( socks_port < 1 || socks_port > 65535 )); then
             error "SOCKS5 地址或端口不合法"
             return
         fi
@@ -512,25 +465,20 @@ create_node() {
         echo "SOCKS5 认证方式："
         echo "1. 无认证"
         echo "2. 用户名密码"
-
         read -rp "选择：" auth
 
         if [[ "$auth" == "2" ]]; then
             read -rp "用户名：" username
             read -rsp "密码：" password
             echo
-
             if [[ -z "$username" || -z "$password" ]]; then
                 error "用户名和密码不能为空"
                 return
             fi
         fi
-
     elif [[ "$choice" != "1" ]]; then
-
         error "无效选择"
         return
-
     fi
 
     mkdir -p "$NODE_DIR/$name"
@@ -543,25 +491,15 @@ SOCKS_PORT='$socks_port'
 SOCKS_USER='$username'
 SOCKS_PASS='$password'
 EOF
-
     chmod 600 "$NODE_DIR/$name/node.env"
 
-    if ! generate_config \
-        "$name" \
-        "$port" \
-        "$mode" \
-        "$host" \
-        "${socks_port:-0}" \
-        "$username" \
-        "$password"; then
-
+    if ! generate_config "$name" "$port" "$mode" "$host" "${socks_port:-0}" "$username" "$password"; then
         rm -rf "$NODE_DIR/$name"
         error "配置生成失败"
         return
     fi
 
-    create_service "$name"
-
+    start_node "$name"
     generate_link "$name"
 }
 
@@ -570,42 +508,29 @@ EOF
 # ==========================================================
 
 list_nodes() {
-
     echo
     echo "========== 节点列表 =========="
-
     local found=0
-
+    
     for dir in "$NODE_DIR"/*; do
-
         [[ -d "$dir" ]] || continue
-
         [[ -f "$dir/node.env" ]] || continue
-
         found=1
-
         source "$dir/node.env"
-
-        local name
-        name="$(basename "$dir")"
-
-        local service="${SERVICE_PREFIX}${name}.service"
-
+        
+        local name="$(basename "$dir")"
         local status="停止"
-
-        if systemctl is-active --quiet "$service"; then
+        
+        if [[ -f "$dir/node.pid" ]] && kill -0 "$(cat "$dir/node.pid" 2>/dev/null)" 2>/dev/null; then
             status="运行中"
         fi
 
-        printf "%-15s %-10s %-10s %-10s\n" \
-            "$name" "$PORT" "$MODE" "$status"
-
+        printf "%-15s %-10s %-10s %-10s\n" "$name" "$PORT" "$MODE" "$status"
     done
 
     if [[ "$found" == "0" ]]; then
         echo "目前没有节点"
     fi
-
     echo "================================"
 }
 
@@ -614,14 +539,11 @@ list_nodes() {
 # ==========================================================
 
 select_node() {
-
     read -rp "请输入节点名称：" NODE
-
     if [[ ! -f "$NODE_DIR/$NODE/node.env" ]]; then
         error "节点不存在"
         return 1
     fi
-
     return 0
 }
 
@@ -630,35 +552,20 @@ select_node() {
 # ==========================================================
 
 node_action() {
-
     select_node || return
-
-    local service="${SERVICE_PREFIX}${NODE}.service"
 
     echo
     echo "1. 启动"
     echo "2. 停止"
     echo "3. 重启"
-    echo "4. 查看状态"
 
     read -rp "选择：" choice
 
     case "$choice" in
-        1)
-            systemctl start "$service"
-            ;;
-        2)
-            systemctl stop "$service"
-            ;;
-        3)
-            systemctl restart "$service"
-            ;;
-        4)
-            systemctl status "$service" --no-pager
-            ;;
-        *)
-            warn "无效选择"
-            ;;
+        1) start_node "$NODE" ;;
+        2) stop_node "$NODE" ;;
+        3) restart_node "$NODE" ;;
+        *) warn "无效选择" ;;
     esac
 }
 
@@ -667,15 +574,12 @@ node_action() {
 # ==========================================================
 
 modify_proxy() {
-
     select_node || return
-
     source "$NODE_DIR/$NODE/node.env"
 
     echo
     echo "1. DIRECT"
     echo "2. SOCKS5"
-
     read -rp "选择：" choice
 
     local mode="direct"
@@ -685,43 +589,26 @@ modify_proxy() {
     local password=""
 
     if [[ "$choice" == "2" ]]; then
-
         mode="socks"
-
         read -rp "SOCKS5 地址：" host
         read -rp "SOCKS5 端口：" port
-
-        if [[ -z "$host" ]] ||
-           ! [[ "$port" =~ ^[0-9]+$ ]] ||
-           (( port < 1 || port > 65535 )); then
+        if [[ -z "$host" ]] || ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
             error "代理地址或端口不合法"
             return
         fi
-
         echo "1. 无认证"
         echo "2. 用户名密码"
-
         read -rp "选择：" auth
-
         if [[ "$auth" == "2" ]]; then
             read -rp "用户名：" username
             read -rsp "密码：" password
             echo
         fi
-
     elif [[ "$choice" != "1" ]]; then
-
         return
     fi
 
-    generate_config \
-        "$NODE" \
-        "$PORT" \
-        "$mode" \
-        "$host" \
-        "$port" \
-        "$username" \
-        "$password" || return
+    generate_config "$NODE" "$PORT" "$mode" "$host" "$port" "$username" "$password" || return
 
     cat > "$NODE_DIR/$NODE/node.env" <<EOF
 PORT='$PORT'
@@ -731,11 +618,8 @@ SOCKS_PORT='$port'
 SOCKS_USER='$username'
 SOCKS_PASS='$password'
 EOF
-
     chmod 600 "$NODE_DIR/$NODE/node.env"
-
-    systemctl restart "${SERVICE_PREFIX}${NODE}.service"
-
+    restart_node "$NODE"
     info "节点代理配置已更新"
 }
 
@@ -744,23 +628,13 @@ EOF
 # ==========================================================
 
 delete_node() {
-
     select_node || return
-
     echo
     read -rp "确认删除节点 $NODE？输入 YES 确认：" confirm
-
     [[ "$confirm" == "YES" ]] || return
 
-    systemctl disable --now \
-        "${SERVICE_PREFIX}${NODE}.service" 2>/dev/null || true
-
-    rm -f "/etc/systemd/system/${SERVICE_PREFIX}${NODE}.service"
-
+    stop_node "$NODE"
     rm -rf "$NODE_DIR/$NODE"
-
-    systemctl daemon-reload
-
     info "节点删除成功"
 }
 
@@ -769,13 +643,13 @@ delete_node() {
 # ==========================================================
 
 show_logs() {
-
     select_node || return
-
-    journalctl \
-        -u "${SERVICE_PREFIX}${NODE}.service" \
-        -n 100 \
-        --no-pager
+    local log_file="$LOG_DIR/${NODE}.log"
+    if [[ -f "$log_file" ]]; then
+        tail -n 100 "$log_file"
+    else
+        info "暂无日志"
+    fi
 }
 
 # ==========================================================
@@ -783,9 +657,7 @@ show_logs() {
 # ==========================================================
 
 show_link() {
-
     select_node || return
-
     generate_link "$NODE"
 }
 
@@ -794,51 +666,30 @@ show_link() {
 # ==========================================================
 
 modify_auth() {
-
     source "$GLOBAL"
-
     echo
     echo "当前 UUID：$UUID"
     echo "当前密码：$PASSWORD"
-
     read -rp "确认重新生成 UUID 和密码？YES：" confirm
-
     [[ "$confirm" == "YES" ]] || return
 
-    UUID="$(cat /proc/sys/kernel/random/uuid)"
+    UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)"
     PASSWORD="$(openssl rand -hex 16)"
 
     cat > "$GLOBAL" <<EOF
 UUID='$UUID'
 PASSWORD='$PASSWORD'
 EOF
-
     chmod 600 "$GLOBAL"
 
-    # 所有节点使用同一组新认证信息
     for dir in "$NODE_DIR"/*; do
-
         [[ -d "$dir" ]] || continue
         [[ -f "$dir/node.env" ]] || continue
-
-        local name
-        name="$(basename "$dir")"
-
+        local name="$(basename "$dir")"
         source "$dir/node.env"
-
-        generate_config \
-            "$name" \
-            "$PORT" \
-            "$MODE" \
-            "$SOCKS_HOST" \
-            "${SOCKS_PORT:-0}" \
-            "$SOCKS_USER" \
-            "$SOCKS_PASS" || continue
-
-        systemctl restart "${SERVICE_PREFIX}${name}.service"
-
+        generate_config "$name" "$PORT" "$MODE" "$SOCKS_HOST" "${SOCKS_PORT:-0}" "$SOCKS_USER" "$SOCKS_PASS" || continue
+        restart_node "$name"
     done
-
     info "全局认证信息已更新"
 }
 
@@ -847,18 +698,13 @@ EOF
 # ==========================================================
 
 modify_ip() {
-
     echo
     echo "当前公网地址：$(cat "$DATA_DIR/public_ip")"
-
     read -rp "请输入新的公网 IP 或域名：" ip
-
     if [[ -z "$ip" ]]; then
         return
     fi
-
     echo "$ip" > "$DATA_DIR/public_ip"
-
     info "公网地址已更新"
 }
 
@@ -867,36 +713,28 @@ modify_ip() {
 # ==========================================================
 
 modify_sni() {
-
     read -rp "请输入新的 SNI：" sni
-
     [[ -n "$sni" ]] || return
 
     openssl req \
         -x509 \
         -nodes \
-        -newkey rsa:2048 \
+        -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -keyout "$CERT_DIR/server.key" \
         -out "$CERT_DIR/server.crt" \
         -days 3650 \
         -subj "/CN=$sni" \
-        -addext "subjectAltName=DNS:$sni"
+        -addext "subjectAltName=DNS:$sni" >/dev/null 2>&1
 
     chmod 600 "$CERT_DIR/server.key"
-
     echo "$sni" > "$DATA_DIR/sni"
 
     for dir in "$NODE_DIR"/*; do
-
         [[ -d "$dir" ]] || continue
         [[ -f "$dir/node.env" ]] || continue
-
-        name="$(basename "$dir")"
-
-        systemctl restart "${SERVICE_PREFIX}${name}.service"
-
+        local name="$(basename "$dir")"
+        restart_node "$name"
     done
-
     info "SNI 和证书已更新"
 }
 
@@ -905,36 +743,16 @@ modify_sni() {
 # ==========================================================
 
 uninstall() {
-
     echo
     warn "即将卸载所有 TUIC 节点！"
-
     read -rp "请输入 UNINSTALL 确认：" confirm
-
     [[ "$confirm" == "UNINSTALL" ]] || return
 
-    for dir in "$NODE_DIR"/*; do
-
-        [[ -d "$dir" ]] || continue
-
-        name="$(basename "$dir")"
-
-        systemctl disable --now \
-            "${SERVICE_PREFIX}${name}.service" 2>/dev/null || true
-
-        rm -f "/etc/systemd/system/${SERVICE_PREFIX}${name}.service"
-
-    done
-
-    systemctl daemon-reload
-
+    pkill -f "$BIN" || true
     rm -rf "$BASE"
-
-    rm -f /usr/local/bin/tuic
-
     echo
-    info "TUIC 数据、配置、节点和服务已删除"
-    warn "sing-box 核心程序没有自动删除，避免影响其他服务。"
+    info "TUIC 数据、配置、节点和程序已彻底删除。"
+    exit 0
 }
 
 # ==========================================================
@@ -942,9 +760,6 @@ uninstall() {
 # ==========================================================
 
 menu() {
-
-    clear
-
     echo -e "${BLUE}"
     echo "======================================"
     echo "          TUIC 多节点管理脚本"
@@ -983,11 +798,10 @@ menu() {
         9) modify_auth ;;
         10) modify_ip ;;
         11) modify_sni ;;
-        12) uninstall; exit 0 ;;
+        12) uninstall ;;
         0) exit 0 ;;
         *) warn "无效选择" ;;
     esac
-
     pause
 }
 
@@ -996,13 +810,9 @@ menu() {
 # ==========================================================
 
 check_root
-
 init_dirs
-
 check_dependencies
-
 install_singbox
-
 init_global
 
 if [[ ! -f "$DATA_DIR/public_ip" ]]; then
@@ -1011,11 +821,6 @@ fi
 
 if [[ ! -f "$DATA_DIR/sni" ]]; then
     create_cert
-fi
-
-# 创建快捷命令
-if [[ ! -e /usr/local/bin/tuic ]]; then
-    ln -s "$(readlink -f "$0")" /usr/local/bin/tuic
 fi
 
 while true; do
