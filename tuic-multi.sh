@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 基于 sing-box 的 TUIC 多节点管理脚本
 # 功能：多个 TUIC 节点共用一个 UUID 和证书；每个节点独立端口、SOCKS5 代理路由。
-# 更新：深度参考 argosbx 补充了 UDP Relay Native 模式及客户端防失联参数。
+# 更新：修复了命令行传入 del 参数进行一键卸载的功能。
 
 set -Eeuo pipefail
 umask 077
@@ -23,10 +23,10 @@ NODES_DIR="$BASE_DIR/nodes"
 AUTH_FILE="$BASE_DIR/tuic-auth.conf"
 CERT_FILE="$BASE_DIR/cert.pem"
 KEY_FILE="$BASE_DIR/key.pem"
+BIN_PATH="$BASE_DIR/sing-box"
 
 ARCH=""
 BIN_NAME=""
-BIN_PATH=""
 NODE_NAME=""
 NODE_DIR=""
 NODE_PORT=""
@@ -161,7 +161,6 @@ ensure_auth() {
 
 ensure_binary() {
     ARCH="$(get_arch)" || { echo "❌ 不支持架构：$(uname -m)" >&2; exit 1; }
-    BIN_PATH="$BASE_DIR/sing-box"
     if [[ -x "$BIN_PATH" ]]; then return 0; fi
 
     local release_file="sing-box-${SINGBOX_VERSION}-linux-${ARCH}"
@@ -289,7 +288,6 @@ write_node_config() {
         fi
     fi
 
-    # 深度参考 argosbx 补全参数
     cat > "$json_file" <<EOF
 {
   "log": {
@@ -339,7 +337,6 @@ get_server_ip() {
 print_link() {
     local ip="$1" url_ip="$1" label="$2"
     if [[ "$url_ip" == *:* && "$url_ip" != \[*\] ]]; then url_ip="[$url_ip]"; fi
-    # 深度参考 argosbx 客户端适配：同时添加 insecure=1, allowInsecure=1, allow_insecure=1 解决客户端不识别问题
     printf 'tuic://%s:%s@%s:%s?congestion_control=bbr&udp_relay_mode=native&alpn=%s&sni=%s&insecure=1&allowInsecure=1&allow_insecure=1#TUIC-%s\n' \
         "$AUTH_UUID" "$AUTH_PASS" "$url_ip" "$NODE_PORT" "$ALPN" "$SNI" "$label"
 }
@@ -501,6 +498,16 @@ show_auth() {
     echo -e "UUID: $AUTH_UUID\n密码: $AUTH_PASS (与 UUID 相同)"
 }
 
+# ===== 新增一键完全卸载功能 =====
+uninstall_script() {
+    echo "🛑 正在停止所有 sing-box 进程..."
+    pkill -f "$BIN_PATH" 2>/dev/null || pkill -f sing-box 2>/dev/null || true
+    echo "🗑️ 正在清理文件与配置目录 ($BASE_DIR)..."
+    rm -rf "$BASE_DIR"
+    echo "✅ 卸载完成，系统已清理干净！"
+    exit 0
+}
+
 menu() {
     while true; do
         echo -e "\n========================================"
@@ -533,6 +540,21 @@ menu() {
 
 main() {
     ensure_root
-    [[ $# -eq 0 ]] && menu || "$@"
+    local cmd="${1:-menu}"
+    
+    # 修复命令行参数路由，支持在末尾加上 del 执行卸载
+    case "$cmd" in
+        menu) menu ;;
+        create) create_node ;;
+        list) list_nodes ;;
+        start) [[ $# -ge 2 ]] || { echo "❌ 用法：$0 start <节点名>"; exit 2; }; start_node "$2" ;;
+        stop) [[ $# -ge 2 ]] || { echo "❌ 用法：$0 stop <节点名>"; exit 2; }; stop_node "$2" ;;
+        restart) [[ $# -ge 2 ]] || { echo "❌ 用法：$0 restart <节点名>"; exit 2; }; restart_node "$2" ;;
+        delete) [[ $# -ge 2 ]] || { echo "❌ 用法：$0 delete <节点名>"; exit 2; }; delete_node "$2" ;;
+        logs) [[ $# -ge 2 ]] || { echo "❌ 用法：$0 logs <节点名>"; exit 2; }; show_logs "$2" ;;
+        auth) show_auth ;;
+        del|uninstall) uninstall_script ;;  # <--- 新增卸载接口
+        *) echo "❌ 未知命令：$cmd" ;;
+    esac
 }
 main "$@"
