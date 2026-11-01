@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # 基于 sing-box 的 TUIC 多节点管理脚本
 # 功能：多个 TUIC 节点共用一个 UUID 和证书；每个节点独立端口、SOCKS5 代理路由、日志和 PID。
+# 新增：动态检测 IPv4/IPv6 栈，防止因禁用 IPv6 导致的内核崩溃。
 
 set -Eeuo pipefail
 umask 077
 
 # -------------------- 全局参数（一般无需修改） --------------------
-SINGBOX_VERSION="1.10.1" # 默认使用的 sing-box 版本
+SINGBOX_VERSION="1.10.1" 
 SNI="${SNI:-www.bing.com}"
 ALPN="${ALPN:-h3}"
 
-# 数据目录选择
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 if [[ -n "${TUIC_BASE_DIR:-}" ]]; then
     BASE_DIR="$TUIC_BASE_DIR"
@@ -102,6 +102,7 @@ install_missing_dependencies() {
     has_cmd curl || missing+=(curl)
     has_cmd openssl || missing+=(openssl)
     has_cmd tar || missing+=(tar)
+    has_cmd ip || missing+=(iproute2)
     if (( ${#missing[@]} == 0 )); then return 0; fi
 
     echo "需要安装依赖：${missing[*]}"
@@ -265,11 +266,26 @@ write_node_config() {
     local json_file="$NODE_DIR/config.json"
     mkdir -p "$NODE_DIR"
     
+    # 检测 IPv4 和 IPv6 栈支持情况
+    local listen_addr="0.0.0.0"
+    local has_v4=0
+    local has_v6=0
+    
+    if ip -4 addr | grep -q 'inet '; then has_v4=1; fi
+    if ip -6 addr | grep -q 'inet6 '; then has_v6=1; fi
+    
+    if [[ $has_v4 -eq 1 && $has_v6 -eq 1 ]]; then
+        listen_addr="::" # 存在双栈，使用 :: 同时监听 v4 和 v6
+    elif [[ $has_v4 -eq 1 ]]; then
+        listen_addr="0.0.0.0" # 仅有 v4
+    elif [[ $has_v6 -eq 1 ]]; then
+        listen_addr="::" # 仅有 v6
+    fi
+    
     # 构建基础的出站配置
     local outbounds_json='[{"type": "direct", "tag": "direct"}]'
     local route_json='{"rules": []}'
 
-    # 如果启用了 SOCKS5，动态组装 JSON
     if [[ "$USE_SOCKS5" == "y" ]]; then
         local auth_block=""
         if [[ -n "$SOCKS_USER" ]]; then
@@ -283,7 +299,6 @@ write_node_config() {
         if [[ "$PROXY_MODE" == "all_proxy" ]]; then
             route_json='{"rules": [{"inbound": ["tuic-in"], "outbound": "socks-out"}]}'
         else
-            # TCP走SOCKS5，UDP直连
             route_json='{"rules": [
                 {"network": ["udp"], "outbound": "direct"},
                 {"inbound": ["tuic-in"], "outbound": "socks-out"}
@@ -291,7 +306,7 @@ write_node_config() {
         fi
     fi
 
-    # 写入最终的 sing-box 配置文件
+    # 写入 JSON
     cat > "$json_file" <<EOF
 {
   "log": {
@@ -302,7 +317,7 @@ write_node_config() {
     {
       "type": "tuic",
       "tag": "tuic-in",
-      "listen": "::",
+      "listen": "${listen_addr}",
       "listen_port": ${NODE_PORT},
       "users": [
         {
@@ -500,17 +515,17 @@ show_auth() {
 menu() {
     while true; do
         echo -e "\n========================================"
-        echo "   TUIC (sing-box 核心) 多节点管理"[cite: 7]
+        echo "   TUIC (sing-box 核心) 多节点管理"
         echo "========================================"
-        echo "1. 创建新节点"[cite: 7]
-        echo "2. 查看所有节点"[cite: 7]
-        echo "3. 启动指定节点"[cite: 7]
-        echo "4. 停止指定节点"[cite: 7]
-        echo "5. 重启指定节点"[cite: 7]
-        echo "6. 删除指定节点"[cite: 7]
-        echo "7. 查看节点日志"[cite: 7]
-        echo "8. 查看公共 UUID 与密码"[cite: 7]
-        echo "9. 退出"[cite: 7]
+        echo "1. 创建新节点"
+        echo "2. 查看所有节点"
+        echo "3. 启动指定节点"
+        echo "4. 停止指定节点"
+        echo "5. 重启指定节点"
+        echo "6. 删除指定节点"
+        echo "7. 查看节点日志"
+        echo "8. 查看公共 UUID 与密码"
+        echo "9. 退出"
         read -r -p "选项 [1-9]: " choice
         case "$choice" in
             1) create_node; pause_enter ;;
