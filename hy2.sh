@@ -1,34 +1,28 @@
 #!/usr/bin/env bash
-# Hysteria2 多节点管理脚本
-# 功能：多个 Hysteria2 节点共用一个 UUID 和证书；每个节点独立端口、SOCKS5 配置、日志和 PID。
-# 代理模式 all_proxy 会尝试让 TCP/UDP 都通过 SOCKS5，实际 UDP 能否正常工作取决于上游 SOCKS5 是否支持 UDP。
+# TUIC 多节点管理脚本
+# 功能：多个 TUIC 节点共用一个 UUID 和证书；每个节点独立端口、SOCKS5 配置（仅记录）、日志和 PID。
 
 set -Eeuo pipefail
 umask 077
 
 # -------------------- 全局参数（一般无需修改） --------------------
-HYSTERIA_VERSION="${HYSTERIA_VERSION:-v2.6.5}"
+TUIC_VERSION="${TUIC_VERSION:-v1.4.5}"
 SNI="${SNI:-www.bing.com}"
 ALPN="${ALPN:-h3}"
 UP_BANDWIDTH="${UP_BANDWIDTH:-200mbps}"
 DOWN_BANDWIDTH="${DOWN_BANDWIDTH:-200mbps}"
 
-# 数据目录选择：
-# 1. 如果脚本是从真实文件运行（例如 bash /root/hy2-multi.sh），默认把数据放在脚本同目录。
-# 2. 如果通过 curl | bash、bash <(curl ...) 等方式运行，BASH_SOURCE 可能指向
-#    /dev/fd 或 /proc/<PID>/fd；这些是临时虚拟路径，不能用 mkdir 创建目录。
-#    此时改用持久目录 /opt/hy2-multi，避免出现 mkdir: cannot create directory '/proc/<PID>'。
-# 3. 用户可通过 HY2_BASE_DIR=/自定义路径 覆盖数据目录。
+# 数据目录选择
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
-if [[ -n "${HY2_BASE_DIR:-}" ]]; then
-    BASE_DIR="$HY2_BASE_DIR"
+if [[ -n "${TUIC_BASE_DIR:-}" ]]; then
+    BASE_DIR="$TUIC_BASE_DIR"
 elif [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" && "$SCRIPT_SOURCE" != /proc/* && "$SCRIPT_SOURCE" != /dev/fd/* && "$SCRIPT_SOURCE" != /dev/stdin ]]; then
     BASE_DIR="$(cd -- "$(dirname -- "$SCRIPT_SOURCE")" && pwd -P)"
 else
-    BASE_DIR="/opt/hy2-multi"
+    BASE_DIR="/opt/tuic-multi"
 fi
 NODES_DIR="$BASE_DIR/nodes"
-AUTH_FILE="$BASE_DIR/hy2-uuid.conf"
+AUTH_FILE="$BASE_DIR/tuic-auth.conf"
 CERT_FILE="$BASE_DIR/cert.pem"
 KEY_FILE="$BASE_DIR/key.pem"
 
@@ -45,13 +39,14 @@ SOCKS_USER=""
 SOCKS_PASS=""
 PROXY_MODE="all_proxy"
 AUTH_UUID=""
+AUTH_PASS=""
 
 # -------------------- 通用小工具 --------------------
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 ensure_root() {
     if [[ "$(id -u)" -ne 0 ]]; then
-        echo "❌ 请使用 root 运行此脚本，例如：sudo bash hy2-multi.sh"
+        echo "❌ 请使用 root 运行此脚本，例如：sudo bash tuic-multi.sh"
         exit 1
     fi
 }
@@ -100,13 +95,11 @@ valid_port() {
 }
 
 valid_node_name() {
-    # 只允许安全文件名，防止节点名称影响文件路径。
     [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$ ]]
 }
 
 normalize_host_port() {
     local host="$1" port="$2"
-    # IPv6 地址需要用方括号包起来，例如 [2001:db8::1]:1080。
     if [[ "$host" == \[*\] ]]; then
         printf '%s:%s' "$host" "$port"
     elif [[ "$host" == *:* ]]; then
@@ -117,7 +110,6 @@ normalize_host_port() {
 }
 
 yaml_quote() {
-    # 将用户输入转换为 YAML 双引号字符串，转义反斜杠和双引号。
     local value="$1"
     value="${value//\\/\\\\}"
     value="${value//\"/\\\"}"
@@ -153,8 +145,8 @@ install_missing_dependencies() {
 
 get_arch() {
     case "$(uname -m | tr '[:upper:]' '[:lower:]')" in
-        x86_64|amd64) printf 'amd64' ;;
-        aarch64|arm64) printf 'arm64' ;;
+        x86_64|amd64) printf 'x86_64-linux' ;;
+        aarch64|arm64) printf 'aarch64-linux' ;;
         *) return 1 ;;
     esac
 }
@@ -177,26 +169,27 @@ generate_uuid() {
     printf '%s\n' "$uuid"
 }
 
-ensure_uuid() {
-    local saved=""
+ensure_auth() {
+    local saved_uuid="" saved_pass=""
     mkdir -p "$BASE_DIR"
     if [[ -f "$AUTH_FILE" ]]; then
-        IFS= read -r saved < "$AUTH_FILE" || true
+        { read -r saved_uuid; read -r saved_pass; } < "$AUTH_FILE" || true
     fi
-    # 复用原脚本 hy2-uuid.conf 中已有的 UUID，确保新节点使用统一密码。
-    if [[ "$saved" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-        AUTH_UUID="${saved,,}"
+    if [[ "$saved_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ && -n "$saved_pass" ]]; then
+        AUTH_UUID="${saved_uuid,,}"
+        AUTH_PASS="$saved_pass"
         chmod 600 "$AUTH_FILE" 2>/dev/null || true
         return 0
     fi
-    if [[ -n "$saved" ]]; then
+    if [[ -n "$saved_uuid" ]]; then
         cp -a "$AUTH_FILE" "${AUTH_FILE}.backup.$(date +%Y%m%d%H%M%S)"
-        echo "⚠️ 原 hy2-uuid.conf 内容不是 UUID，已备份原文件。"
+        echo "⚠️ 原 tuic-auth.conf 内容格式不正确，已备份原文件。"
     fi
     AUTH_UUID="$(generate_uuid)"
-    printf '%s\n' "$AUTH_UUID" > "$AUTH_FILE"
+    AUTH_PASS="$(openssl rand -hex 16)"
+    printf '%s\n%s\n' "$AUTH_UUID" "$AUTH_PASS" > "$AUTH_FILE"
     chmod 600 "$AUTH_FILE"
-    echo "✅ 已生成公共 UUID，并保存到：$AUTH_FILE"
+    echo "✅ 已生成公共 UUID 及密码，并保存到：$AUTH_FILE"
 }
 
 ensure_binary() {
@@ -204,13 +197,13 @@ ensure_binary() {
         echo "❌ 不支持当前 CPU 架构：$(uname -m)" >&2
         exit 1
     }
-    BIN_NAME="hysteria-linux-${ARCH}"
-    BIN_PATH="$BASE_DIR/$BIN_NAME"
+    BIN_NAME="tuic-server-${ARCH}"
+    BIN_PATH="$BASE_DIR/tuic-server"
     if [[ -x "$BIN_PATH" ]]; then return 0; fi
 
-    local url="https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/${BIN_NAME}"
+    local url="https://github.com/Itsusinn/tuic/releases/download/${TUIC_VERSION}/${BIN_NAME}"
     local tmp="${BIN_PATH}.download"
-    echo "⏳ 正在下载 Hysteria2 ${HYSTERIA_VERSION}（${ARCH}）..."
+    echo "⏳ 正在下载 TUIC ${TUIC_VERSION}（${ARCH}）..."
     if ! curl -fL --retry 3 --connect-timeout 30 --output "$tmp" "$url"; then
         rm -f "$tmp"
         echo "❌ 下载失败：$url" >&2
@@ -218,7 +211,7 @@ ensure_binary() {
     fi
     chmod 755 "$tmp"
     mv -f "$tmp" "$BIN_PATH"
-    echo "✅ Hysteria2 内核已准备好：$BIN_PATH"
+    echo "✅ TUIC 内核已准备好：$BIN_PATH"
 }
 
 ensure_certificate() {
@@ -238,14 +231,13 @@ ensure_common_files() {
     ensure_root
     install_missing_dependencies
     mkdir -p "$NODES_DIR"
-    ensure_uuid
+    ensure_auth
     ensure_binary
     ensure_certificate
 }
 
 # -------------------- 节点配置文件 --------------------
 save_node_meta() {
-    # 用 Bash 的 %q 格式安全保存变量；node.conf 权限为 600。
     local file="$NODE_DIR/node.conf"
     mkdir -p "$NODE_DIR"
     {
@@ -272,8 +264,6 @@ load_node() {
         echo "❌ 找不到节点：$name" >&2
         return 1
     fi
-    # node.conf 由本脚本通过 printf %q 生成，且仅 root 可读写。
-    # shellcheck disable=SC1090
     source "$NODE_DIR/node.conf"
     return 0
 }
@@ -282,7 +272,6 @@ port_already_managed() {
     local wanted="$1" conf port
     shopt -s nullglob
     for conf in "$NODES_DIR"/*/node.conf; do
-        # 使用子 Shell 读取现有节点端口，避免覆盖当前正在创建的节点变量。
         port="$( ( unset NODE_PORT; source "$conf"; printf '%s' "${NODE_PORT:-}" ) )"
         if [[ "$port" == "$wanted" ]]; then
             shopt -u nullglob
@@ -295,7 +284,6 @@ port_already_managed() {
 
 port_in_use_by_system() {
     local port="$1"
-    # Hysteria2 主要监听 UDP；这里同时检查 TCP 和 UDP，避免端口冲突。
     if has_cmd ss; then
         ss -H -lntu "sport = :$port" 2>/dev/null | grep . >/dev/null
     elif has_cmd lsof; then
@@ -308,7 +296,7 @@ port_in_use_by_system() {
 choose_port() {
     local value default_port="${1:-22222}"
     while true; do
-        read_value "请输入 Hysteria2 监听端口" "$default_port"
+        read_value "请输入 TUIC 监听端口" "$default_port"
         value="$REPLY"
         if ! valid_port "$value"; then
             echo "❌ 端口必须是 1-65535 的整数。"
@@ -328,58 +316,40 @@ choose_port() {
 }
 
 write_node_config() {
-    local yaml_file="$NODE_DIR/server.yaml" addr=""
+    local toml_file="$NODE_DIR/server.toml"
     mkdir -p "$NODE_DIR"
-    {
-        printf 'listen: %s\n' "$(yaml_quote ":${NODE_PORT}")"
-        printf 'tls:\n  cert: %s\n  key: %s\n  alpn:\n    - %s\n' \
-            "$(yaml_quote "$CERT_FILE")" "$(yaml_quote "$KEY_FILE")" "$(yaml_quote "$ALPN")"
-        printf 'auth:\n  type: "password"\n  password: %s\n' "$(yaml_quote "$AUTH_UUID")"
-        printf 'bandwidth:\n  up: %s\n  down: %s\n' "$(yaml_quote "$UP_BANDWIDTH")" "$(yaml_quote "$DOWN_BANDWIDTH")"
-        cat <<'YAML'
-quic:
-  max_idle_timeout: "10s"
-  max_concurrent_streams: 4
-  initial_stream_receive_window: 65536
-  max_stream_receive_window: 131072
-  initial_conn_receive_window: 131072
-  max_conn_receive_window: 262144
-YAML
-        if [[ "$USE_SOCKS5" == "y" ]]; then
-            addr="$(normalize_host_port "$SOCKS_HOST" "$SOCKS_PORT")"
-            cat <<YAML
-outbounds:
-  - name: socks_proxy
-    type: socks5
-    socks5:
-      addr: $(yaml_quote "$addr")
-YAML
-            if [[ -n "$SOCKS_USER" && -n "$SOCKS_PASS" ]]; then
-                printf '      username: %s\n      password: %s\n' "$(yaml_quote "$SOCKS_USER")" "$(yaml_quote "$SOCKS_PASS")"
-            fi
-            if [[ "$PROXY_MODE" == "all_proxy" ]]; then
-                cat <<'YAML'
-acl:
-  inline:
-    - socks_proxy(all)
-YAML
-            else
-                cat <<'YAML'
-acl:
-  inline:
-    - socks_proxy(all, tcp/*)
-    - direct(all)
-YAML
-            fi
-        else
-            cat <<'YAML'
-acl:
-  inline:
-    - direct(all)
-YAML
-        fi
-    } > "$yaml_file"
-    chmod 600 "$yaml_file"
+    
+    cat > "$toml_file" <<EOF
+log_level = "warn"
+server = "0.0.0.0:${NODE_PORT}"
+udp_relay_ipv6 = false
+zero_rtt_handshake = true
+dual_stack = false
+auth_timeout = "8s"
+task_negotiation_timeout = "4s"
+gc_interval = "8s"
+gc_lifetime = "8s"
+max_external_packet_size = 8192
+
+[users]
+${AUTH_UUID} = "${AUTH_PASS}"
+
+[tls]
+certificate = "${CERT_FILE}"
+private_key = "${KEY_FILE}"
+alpn = ["${ALPN}"]
+EOF
+
+    if [[ "$USE_SOCKS5" == "y" ]]; then
+        cat <<EOF >> "$toml_file"
+
+# 提示：保留了您选择的 SOCKS5 代理参数记录，但 TUIC v1.4.5 服务端原生并不直接支持 SOCKS5 出站分流，此配置将直连。
+# SOCKS_HOST = "${SOCKS_HOST}"
+# SOCKS_PORT = "${SOCKS_PORT}"
+EOF
+    fi
+
+    chmod 600 "$toml_file"
 }
 
 # -------------------- 显示信息、节点生命周期 --------------------
@@ -395,30 +365,29 @@ get_server_ip() {
 print_link() {
     local ip="$1" url_ip="$1" label="$2"
     if [[ "$url_ip" == *:* && "$url_ip" != \[*\] ]]; then url_ip="[$url_ip]"; fi
-    printf 'hysteria2://%s@%s:%s?sni=%s&alpn=%s&insecure=1#Hy2-%s\n' \
-        "$AUTH_UUID" "$url_ip" "$NODE_PORT" "$SNI" "$ALPN" "$label"
+    printf 'tuic://%s:%s@%s:%s?congestion_control=bbr&alpn=%s&allowInsecure=1&sni=%s&udp_relay_mode=native#TUIC-%s\n' \
+        "$AUTH_UUID" "$AUTH_PASS" "$url_ip" "$NODE_PORT" "$ALPN" "$SNI" "$label"
 }
 
 node_is_running() {
     local pid="" command_line=""
-    [[ -f "$NODE_DIR/hysteria.pid" ]] || return 1
-    IFS= read -r pid < "$NODE_DIR/hysteria.pid" || true
+    [[ -f "$NODE_DIR/tuic.pid" ]] || return 1
+    IFS= read -r pid < "$NODE_DIR/tuic.pid" || true
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     kill -0 "$pid" 2>/dev/null || return 1
-    # 除了确认 PID 存在，还要核对它确实是本节点的 Hysteria 进程，避免 PID 重用后误杀其他程序。
     if [[ -r "/proc/$pid/cmdline" ]]; then
         command_line="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
     else
         command_line="$(ps -p "$pid" -o args= 2>/dev/null || true)"
     fi
-    [[ "$command_line" == *"$NODE_DIR/server.yaml"* && "$command_line" == *"hysteria"* ]]
+    [[ "$command_line" == *"$NODE_DIR/server.toml"* && "$command_line" == *"tuic"* ]]
 }
 
 create_node() {
     ensure_common_files
     local name_value="" use_auth="n" mode_value="2" server_ip=""
     echo ""
-    echo "创建新 Hysteria2 节点"
+    echo "创建新 TUIC 节点"
     echo "节点名称只能使用英文、数字、点、下划线和短横线，例如 A、B、Tokyo-2。"
     while true; do
         read_value "请输入节点名称" "A"
@@ -503,7 +472,7 @@ create_node() {
     save_node_meta
     write_node_config
     echo ""
-    echo "节点配置已生成：$NODE_DIR/server.yaml"
+    echo "节点配置已生成：$NODE_DIR/server.toml"
     echo "端口：$NODE_PORT/UDP"
     if [[ "$USE_SOCKS5" == "y" ]]; then
         echo "SOCKS5：$SOCKS_HOST:$SOCKS_PORT"
@@ -519,6 +488,7 @@ create_node() {
     echo ""
     echo "✅ 节点创建完成。"
     echo "共享 UUID：$AUTH_UUID"
+    echo "共享 密码：$AUTH_PASS"
     echo "节点链接（客户端需允许不安全证书 insecure=1）："
     print_link "$server_ip" "$NODE_NAME"
     echo "⚠️ 请在云厂商防火墙/安全组和 VPS 防火墙中放行 UDP 端口 $NODE_PORT。"
@@ -529,26 +499,26 @@ start_node() {
     load_node "$name" || return 1
     if [[ ! -x "$BIN_PATH" ]]; then ensure_common_files; fi
     if node_is_running; then
-        echo "ℹ️ 节点 $NODE_NAME 已在运行，PID：$(cat "$NODE_DIR/hysteria.pid")"
+        echo "ℹ️ 节点 $NODE_NAME 已在运行，PID：$(cat "$NODE_DIR/tuic.pid")"
         return 0
     fi
-    rm -f "$NODE_DIR/hysteria.pid"
-    if [[ ! -f "$NODE_DIR/server.yaml" ]]; then
-        AUTH_UUID="$(cat "$AUTH_FILE")"
+    rm -f "$NODE_DIR/tuic.pid"
+    if [[ ! -f "$NODE_DIR/server.toml" ]]; then
+        { read -r AUTH_UUID; read -r AUTH_PASS; } < "$AUTH_FILE"
         write_node_config
     fi
     echo "🚀 正在启动节点 $NODE_NAME（UDP/$NODE_PORT）..."
-    nohup "$BIN_PATH" server -c "$NODE_DIR/server.yaml" > "$NODE_DIR/hysteria.log" 2>&1 </dev/null &
+    nohup "$BIN_PATH" -c "$NODE_DIR/server.toml" > "$NODE_DIR/tuic.log" 2>&1 </dev/null &
     pid=$!
-    printf '%s\n' "$pid" > "$NODE_DIR/hysteria.pid"
+    printf '%s\n' "$pid" > "$NODE_DIR/tuic.pid"
     sleep 2
     if kill -0 "$pid" 2>/dev/null; then
         echo "✅ 节点 $NODE_NAME 已启动，PID：$pid"
-        echo "日志：$NODE_DIR/hysteria.log"
+        echo "日志：$NODE_DIR/tuic.log"
     else
-        rm -f "$NODE_DIR/hysteria.pid"
+        rm -f "$NODE_DIR/tuic.pid"
         echo "❌ 节点启动失败，请查看日志："
-        tail -n 60 "$NODE_DIR/hysteria.log" 2>/dev/null || true
+        tail -n 60 "$NODE_DIR/tuic.log" 2>/dev/null || true
         return 1
     fi
 }
@@ -557,11 +527,11 @@ stop_node() {
     local name="$1" pid="" i
     load_node "$name" || return 1
     if ! node_is_running; then
-        rm -f "$NODE_DIR/hysteria.pid"
+        rm -f "$NODE_DIR/tuic.pid"
         echo "ℹ️ 节点 $NODE_NAME 当前没有运行。"
         return 0
     fi
-    IFS= read -r pid < "$NODE_DIR/hysteria.pid" || true
+    IFS= read -r pid < "$NODE_DIR/tuic.pid" || true
     echo "🛑 正在停止节点 $NODE_NAME（PID：$pid）..."
     kill "$pid" 2>/dev/null || true
     for ((i=0; i<10; i++)); do
@@ -571,7 +541,7 @@ stop_node() {
     if kill -0 "$pid" 2>/dev/null; then
         kill -9 "$pid" 2>/dev/null || true
     fi
-    rm -f "$NODE_DIR/hysteria.pid"
+    rm -f "$NODE_DIR/tuic.pid"
     echo "✅ 节点 $NODE_NAME 已停止。"
 }
 
@@ -593,14 +563,13 @@ list_nodes() {
     printf '\n%-18s %-8s %-10s %-12s %-12s\n' '节点名称' '端口/UDP' '运行状态' 'SOCKS5' '模式'
     printf '%-18s %-8s %-10s %-12s %-12s\n' '------------------' '--------' '----------' '------------' '------------'
     for conf in "${files[@]}"; do
-        # shellcheck disable=SC1090
         source "$conf"
         name="${NODE_NAME:-$(basename "$(dirname "$conf")")}"
         port="${NODE_PORT:-?}"
         proxy="否"
         [[ "${USE_SOCKS5:-n}" == "y" ]] && proxy="${SOCKS_HOST:-?}:${SOCKS_PORT:-?}"
         mode="${PROXY_MODE:-direct}"
-        if [[ -f "$(dirname "$conf")/hysteria.pid" ]] && kill -0 "$(cat "$(dirname "$conf")/hysteria.pid" 2>/dev/null)" 2>/dev/null; then
+        if [[ -f "$(dirname "$conf")/tuic.pid" ]] && kill -0 "$(cat "$(dirname "$conf")/tuic.pid" 2>/dev/null)" 2>/dev/null; then
             status="运行中"
         else
             status="已停止"
@@ -618,7 +587,7 @@ ask_node_name() {
 delete_node() {
     local name="$1" dir="$NODES_DIR/$1"
     load_node "$name" || return 1
-    echo "即将删除节点 $NODE_NAME（端口 $NODE_PORT），这不会删除其他节点、公共 UUID 或共享证书。"
+    echo "即将删除节点 $NODE_NAME（端口 $NODE_PORT），这不会删除其他节点、公共账号信息或共享证书。"
     ask_yes_no "确认删除" "n"
     [[ "$REPLY" == "y" ]] || { echo "已取消。"; return 0; }
     stop_node "$name" || true
@@ -629,23 +598,24 @@ delete_node() {
 show_logs() {
     local name="$1"
     load_node "$name" || return 1
-    if [[ ! -f "$NODE_DIR/hysteria.log" ]]; then
+    if [[ ! -f "$NODE_DIR/tuic.log" ]]; then
         echo "该节点尚无日志文件。"
         return 0
     fi
     echo "显示 $name 的最近日志；按 Ctrl+C 返回菜单。"
-    tail -n 100 -f "$NODE_DIR/hysteria.log"
+    tail -n 100 -f "$NODE_DIR/tuic.log"
 }
 
-show_uuid() {
-    ensure_uuid
-    echo "公共 Hysteria2 UUID：$AUTH_UUID"
+show_auth() {
+    ensure_auth
+    echo "公共 TUIC UUID：$AUTH_UUID"
+    echo "公共 TUIC 密码：$AUTH_PASS"
     echo "文件：$AUTH_FILE（权限应为 600，请勿公开分享）"
 }
 
 print_help() {
     cat <<EOF
-Hysteria2 多节点管理脚本
+TUIC 多节点管理脚本
 
 交互式菜单：
   bash "${BASH_SOURCE[0]}"
@@ -658,11 +628,11 @@ Hysteria2 多节点管理脚本
   bash "${BASH_SOURCE[0]}" restart <节点名>
   bash "${BASH_SOURCE[0]}" delete <节点名>
   bash "${BASH_SOURCE[0]}" logs <节点名>
-  bash "${BASH_SOURCE[0]}" uuid
+  bash "${BASH_SOURCE[0]}" auth
   bash "${BASH_SOURCE[0]}" help
 
 数据目录：${BASE_DIR}/nodes/<节点名>/
-公共 UUID：${AUTH_FILE}
+公共鉴权：${AUTH_FILE}
 公共证书：${CERT_FILE} 和 ${KEY_FILE}
 EOF
 }
@@ -672,7 +642,7 @@ menu() {
     while true; do
         echo ""
         echo "===================================================="
-        echo "          Hysteria2 多节点管理脚本"
+        echo "          TUIC 多节点管理脚本"
         echo "===================================================="
         echo "1. 创建新节点"
         echo "2. 查看所有节点"
@@ -681,7 +651,7 @@ menu() {
         echo "5. 重启指定节点"
         echo "6. 删除指定节点"
         echo "7. 查看节点日志"
-        echo "8. 查看公共 UUID"
+        echo "8. 查看公共验证信息"
         echo "9. 退出"
         read -r -p "请输入选项 [1-9]：" choice
         case "$choice" in
@@ -692,7 +662,7 @@ menu() {
             5) ask_node_name; restart_node "$REPLY"; pause_enter ;;
             6) ask_node_name; delete_node "$REPLY"; pause_enter ;;
             7) ask_node_name; show_logs "$REPLY"; pause_enter ;;
-            8) show_uuid; pause_enter ;;
+            8) show_auth; pause_enter ;;
             9|q|Q) exit 0 ;;
             *) echo "❌ 请输入 1-9 之间的选项。" ;;
         esac
@@ -711,11 +681,10 @@ main() {
         restart) [[ $# -ge 2 ]] || { echo "用法：$0 restart <节点名>"; exit 2; }; restart_node "$2" ;;
         delete|del|rm) [[ $# -ge 2 ]] || { echo "用法：$0 delete <节点名>"; exit 2; }; delete_node "$2" ;;
         logs) [[ $# -ge 2 ]] || { echo "用法：$0 logs <节点名>"; exit 2; }; show_logs "$2" ;;
-        uuid) show_uuid ;;
+        auth|uuid) show_auth ;;
         help|-h|--help) print_help ;;
         *) echo "❌ 未知命令：$cmd"; print_help; exit 2 ;;
     esac
 }
 
 main "$@"
-
