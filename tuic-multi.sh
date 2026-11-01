@@ -1,828 +1,721 @@
 #!/usr/bin/env bash
-
-# ==========================================================
-# TUIC Multi-Node Manager (Repaired Version)
-# 基于 sing-box
-# 修复：自动安装依赖(jq等)、适配翼龙面板(移除 systemd 改用 nohup)、兼容性提升
-# ==========================================================
+# Hysteria2 多节点管理脚本
+# 功能：多个 Hysteria2 节点共用一个 UUID 和证书；每个节点独立端口、SOCKS5 配置、日志和 PID。
+# 代理模式 all_proxy 会尝试让 TCP/UDP 都通过 SOCKS5，实际 UDP 能否正常工作取决于上游 SOCKS5 是否支持 UDP。
 
 set -Eeuo pipefail
+umask 077
 
-BASE="/opt/tuic"
-NODE_DIR="$BASE/nodes"
-CERT_DIR="$BASE/cert"
-DATA_DIR="$BASE/data"
-LOG_DIR="$BASE/logs"
-GLOBAL="$DATA_DIR/global.env"
+# -------------------- 全局参数（一般无需修改） --------------------
+HYSTERIA_VERSION="${HYSTERIA_VERSION:-v2.6.5}"
+SNI="${SNI:-www.bing.com}"
+ALPN="${ALPN:-h3}"
+UP_BANDWIDTH="${UP_BANDWIDTH:-200mbps}"
+DOWN_BANDWIDTH="${DOWN_BANDWIDTH:-200mbps}"
 
-BIN="$BASE/sing-box"
+# 数据目录选择：
+# 1. 如果脚本是从真实文件运行（例如 bash /root/hy2-multi.sh），默认把数据放在脚本同目录。
+# 2. 如果通过 curl | bash、bash <(curl ...) 等方式运行，BASH_SOURCE 可能指向
+#    /dev/fd 或 /proc/<PID>/fd；这些是临时虚拟路径，不能用 mkdir 创建目录。
+#    此时改用持久目录 /opt/hy2-multi，避免出现 mkdir: cannot create directory '/proc/<PID>'。
+# 3. 用户可通过 HY2_BASE_DIR=/自定义路径 覆盖数据目录。
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
+if [[ -n "${HY2_BASE_DIR:-}" ]]; then
+    BASE_DIR="$HY2_BASE_DIR"
+elif [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" && "$SCRIPT_SOURCE" != /proc/* && "$SCRIPT_SOURCE" != /dev/fd/* && "$SCRIPT_SOURCE" != /dev/stdin ]]; then
+    BASE_DIR="$(cd -- "$(dirname -- "$SCRIPT_SOURCE")" && pwd -P)"
+else
+    BASE_DIR="/opt/hy2-multi"
+fi
+NODES_DIR="$BASE_DIR/nodes"
+AUTH_FILE="$BASE_DIR/hy2-uuid.conf"
+CERT_FILE="$BASE_DIR/cert.pem"
+KEY_FILE="$BASE_DIR/key.pem"
 
-# ==========================================================
-# 基础函数
-# ==========================================================
+ARCH=""
+BIN_NAME=""
+BIN_PATH=""
+NODE_NAME=""
+NODE_DIR=""
+NODE_PORT=""
+USE_SOCKS5="n"
+SOCKS_HOST=""
+SOCKS_PORT="1080"
+SOCKS_USER=""
+SOCKS_PASS=""
+PROXY_MODE="all_proxy"
+AUTH_UUID=""
 
-RED='\033[31m'
-GREEN='\033[32m'
-YELLOW='\033[33m'
-BLUE='\033[34m'
-NC='\033[0m'
+# -------------------- 通用小工具 --------------------
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-info() {
-    echo -e "${GREEN}[信息]${NC} $*"
-}
-
-warn() {
-    echo -e "${YELLOW}[警告]${NC} $*"
-}
-
-error() {
-    echo -e "${RED}[错误]${NC} $*"
-}
-
-pause() {
-    read -rp "按回车键继续..."
-}
-
-check_root() {
-    if [[ "$EUID" -ne 0 ]]; then
-        error "请使用 root 用户运行！"
+ensure_root() {
+    if [[ "$(id -u)" -ne 0 ]]; then
+        echo "❌ 请使用 root 运行此脚本，例如：sudo bash hy2-multi.sh"
         exit 1
     fi
 }
 
-check_dependencies() {
+pause_enter() {
+    if [[ -t 0 ]]; then
+        read -r -p $'\n按回车键继续...' _ || true
+    fi
+}
+
+read_value() {
+    local prompt="$1" default_value="${2:-}" value=""
+    if [[ -n "$default_value" ]]; then
+        read -r -p "$prompt [$default_value]: " value
+        REPLY="${value:-$default_value}"
+    else
+        read -r -p "$prompt: " value
+        REPLY="$value"
+    fi
+}
+
+read_secret() {
+    local prompt="$1" value=""
+    read -r -s -p "$prompt: " value
+    printf '\n'
+    REPLY="$value"
+}
+
+ask_yes_no() {
+    local prompt="$1" default_value="${2:-n}" value=""
+    local hint="y/N"
+    [[ "$default_value" == "y" ]] && hint="Y/n"
+    while true; do
+        read -r -p "$prompt [$hint]: " value
+        value="${value:-$default_value}"
+        case "${value,,}" in
+            y|yes) REPLY="y"; return 0 ;;
+            n|no)  REPLY="n"; return 0 ;;
+            *) echo "请输入 y 或 n。" ;;
+        esac
+    done
+}
+
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+valid_node_name() {
+    # 只允许安全文件名，防止节点名称影响文件路径。
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$ ]]
+}
+
+normalize_host_port() {
+    local host="$1" port="$2"
+    # IPv6 地址需要用方括号包起来，例如 [2001:db8::1]:1080。
+    if [[ "$host" == \[*\] ]]; then
+        printf '%s:%s' "$host" "$port"
+    elif [[ "$host" == *:* ]]; then
+        printf '[%s]:%s' "$host" "$port"
+    else
+        printf '%s:%s' "$host" "$port"
+    fi
+}
+
+yaml_quote() {
+    # 将用户输入转换为 YAML 双引号字符串，转义反斜杠和双引号。
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\r'/}"
+    value="${value//$'\n'/\\n}"
+    printf '"%s"' "$value"
+}
+
+# -------------------- 系统依赖、UUID、二进制和证书 --------------------
+install_missing_dependencies() {
     local missing=()
-    for cmd in curl jq openssl tar; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing+=("$cmd")
+    has_cmd curl || missing+=(curl)
+    has_cmd openssl || missing+=(openssl)
+    if (( ${#missing[@]} == 0 )); then return 0; fi
+
+    echo "需要安装依赖：${missing[*]}"
+    if has_cmd apt-get; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+    elif has_cmd dnf; then
+        dnf install -y "${missing[@]}"
+    elif has_cmd yum; then
+        yum install -y "${missing[@]}"
+    elif has_cmd apk; then
+        apk add --no-cache "${missing[@]}"
+    elif has_cmd zypper; then
+        zypper --non-interactive install "${missing[@]}"
+    else
+        echo "❌ 找不到受支持的包管理器，请手动安装 curl 和 openssl。" >&2
+        exit 1
+    fi
+}
+
+get_arch() {
+    case "$(uname -m | tr '[:upper:]' '[:lower:]')" in
+        x86_64|amd64) printf 'amd64' ;;
+        aarch64|arm64) printf 'arm64' ;;
+        *) return 1 ;;
+    esac
+}
+
+generate_uuid() {
+    local uuid=""
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+        IFS= read -r uuid < /proc/sys/kernel/random/uuid || true
+    elif has_cmd uuidgen; then
+        uuid="$(uuidgen 2>/dev/null || true)"
+    else
+        uuid="$(openssl rand -hex 16)"
+        uuid="${uuid:0:8}-${uuid:8:4}-4${uuid:13:3}-8${uuid:17:3}-${uuid:20:12}"
+    fi
+    uuid="${uuid,,}"
+    [[ "$uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || {
+        echo "❌ 生成 UUID 失败。" >&2
+        return 1
+    }
+    printf '%s\n' "$uuid"
+}
+
+ensure_uuid() {
+    local saved=""
+    mkdir -p "$BASE_DIR"
+    if [[ -f "$AUTH_FILE" ]]; then
+        IFS= read -r saved < "$AUTH_FILE" || true
+    fi
+    # 复用原脚本 hy2-uuid.conf 中已有的 UUID，确保新节点使用统一密码。
+    if [[ "$saved" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        AUTH_UUID="${saved,,}"
+        chmod 600 "$AUTH_FILE" 2>/dev/null || true
+        return 0
+    fi
+    if [[ -n "$saved" ]]; then
+        cp -a "$AUTH_FILE" "${AUTH_FILE}.backup.$(date +%Y%m%d%H%M%S)"
+        echo "⚠️ 原 hy2-uuid.conf 内容不是 UUID，已备份原文件。"
+    fi
+    AUTH_UUID="$(generate_uuid)"
+    printf '%s\n' "$AUTH_UUID" > "$AUTH_FILE"
+    chmod 600 "$AUTH_FILE"
+    echo "✅ 已生成公共 UUID，并保存到：$AUTH_FILE"
+}
+
+ensure_binary() {
+    ARCH="$(get_arch)" || {
+        echo "❌ 不支持当前 CPU 架构：$(uname -m)" >&2
+        exit 1
+    }
+    BIN_NAME="hysteria-linux-${ARCH}"
+    BIN_PATH="$BASE_DIR/$BIN_NAME"
+    if [[ -x "$BIN_PATH" ]]; then return 0; fi
+
+    local url="https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/${BIN_NAME}"
+    local tmp="${BIN_PATH}.download"
+    echo "⏳ 正在下载 Hysteria2 ${HYSTERIA_VERSION}（${ARCH}）..."
+    if ! curl -fL --retry 3 --connect-timeout 30 --output "$tmp" "$url"; then
+        rm -f "$tmp"
+        echo "❌ 下载失败：$url" >&2
+        exit 1
+    fi
+    chmod 755 "$tmp"
+    mv -f "$tmp" "$BIN_PATH"
+    echo "✅ Hysteria2 内核已准备好：$BIN_PATH"
+}
+
+ensure_certificate() {
+    if [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]]; then
+        chmod 600 "$KEY_FILE" 2>/dev/null || true
+        return 0
+    fi
+    echo "🔐 正在生成共享自签名证书（SNI：$SNI）..."
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -days 3650 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=${SNI}" >/dev/null 2>&1
+    chmod 600 "$KEY_FILE"
+    chmod 644 "$CERT_FILE"
+    echo "✅ 共享证书已生成。客户端链接会使用 insecure=1。"
+}
+
+ensure_common_files() {
+    ensure_root
+    install_missing_dependencies
+    mkdir -p "$NODES_DIR"
+    ensure_uuid
+    ensure_binary
+    ensure_certificate
+}
+
+# -------------------- 节点配置文件 --------------------
+save_node_meta() {
+    # 用 Bash 的 %q 格式安全保存变量；node.conf 权限为 600。
+    local file="$NODE_DIR/node.conf"
+    mkdir -p "$NODE_DIR"
+    {
+        printf 'NODE_NAME=%q\n' "$NODE_NAME"
+        printf 'NODE_PORT=%q\n' "$NODE_PORT"
+        printf 'USE_SOCKS5=%q\n' "$USE_SOCKS5"
+        printf 'SOCKS_HOST=%q\n' "$SOCKS_HOST"
+        printf 'SOCKS_PORT=%q\n' "$SOCKS_PORT"
+        printf 'SOCKS_USER=%q\n' "$SOCKS_USER"
+        printf 'SOCKS_PASS=%q\n' "$SOCKS_PASS"
+        printf 'PROXY_MODE=%q\n' "$PROXY_MODE"
+    } > "$file"
+    chmod 600 "$file"
+}
+
+load_node() {
+    local name="$1"
+    if ! valid_node_name "$name"; then
+        echo "❌ 节点名称格式不正确。只允许英文、数字、点、下划线和短横线。" >&2
+        return 1
+    fi
+    NODE_DIR="$NODES_DIR/$name"
+    if [[ ! -f "$NODE_DIR/node.conf" ]]; then
+        echo "❌ 找不到节点：$name" >&2
+        return 1
+    fi
+    # node.conf 由本脚本通过 printf %q 生成，且仅 root 可读写。
+    # shellcheck disable=SC1090
+    source "$NODE_DIR/node.conf"
+    return 0
+}
+
+port_already_managed() {
+    local wanted="$1" conf port
+    shopt -s nullglob
+    for conf in "$NODES_DIR"/*/node.conf; do
+        # 使用子 Shell 读取现有节点端口，避免覆盖当前正在创建的节点变量。
+        port="$( ( unset NODE_PORT; source "$conf"; printf '%s' "${NODE_PORT:-}" ) )"
+        if [[ "$port" == "$wanted" ]]; then
+            shopt -u nullglob
+            return 0
         fi
     done
-    
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        info "正在自动安装缺失的依赖：${missing[*]}..."
-        if command -v apt-get >/dev/null 2>&1; then
-            apt-get update -y && apt-get install -y "${missing[@]}"
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y "${missing[@]}"
-        elif command -v apk >/dev/null 2>&1; then
-            apk add --no-cache "${missing[@]}"
-        else
-            error "无法自动安装包，请手动安装: ${missing[*]}"
-            exit 1
-        fi
-        info "依赖安装完成。"
-    fi
+    shopt -u nullglob
+    return 1
 }
 
-# ==========================================================
-# 初始化目录
-# ==========================================================
-
-init_dirs() {
-    mkdir -p \
-        "$NODE_DIR" \
-        "$CERT_DIR" \
-        "$DATA_DIR" \
-        "$LOG_DIR"
-}
-
-# ==========================================================
-# 安装 sing-box (通用二进制包)
-# ==========================================================
-
-install_singbox() {
-    if [[ -x "$BIN" ]]; then
-        info "检测到 sing-box 已安装"
-        "$BIN" version
-        return
-    fi
-
-    info "正在安装 sing-box..."
-
-    local arch="$(uname -m)"
-    case "$arch" in
-        x86_64|amd64) arch="amd64" ;;
-        aarch64|arm64) arch="arm64" ;;
-        *)
-            error "暂不支持该 CPU 架构：$arch"
-            return 1
-            ;;
-    esac
-
-    local SINGBOX_VERSION="1.10.1"
-    local release_file="sing-box-${SINGBOX_VERSION}-linux-${arch}"
-    local url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${release_file}.tar.gz"
-    local tmp_dir="/tmp/singbox_tmp"
-    
-    mkdir -p "$tmp_dir"
-    if ! curl -fL "$url" -o "$tmp_dir/sb.tar.gz"; then
-        error "下载 sing-box 失败"
-        rm -rf "$tmp_dir"
+port_in_use_by_system() {
+    local port="$1"
+    # Hysteria2 主要监听 UDP；这里同时检查 TCP 和 UDP，避免端口冲突。
+    if has_cmd ss; then
+        ss -H -lntu "sport = :$port" 2>/dev/null | grep . >/dev/null
+    elif has_cmd lsof; then
+        lsof -nP -iTCP:"$port" -iUDP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+    else
         return 1
     fi
-    
-    tar -xzf "$tmp_dir/sb.tar.gz" -C "$tmp_dir"
-    mv -f "$tmp_dir/${release_file}/sing-box" "$BIN"
-    chmod 755 "$BIN"
-    rm -rf "$tmp_dir"
-
-    if [[ ! -x "$BIN" ]]; then
-        error "sing-box 安装失败"
-        return 1
-    fi
-
-    info "sing-box 安装完成"
 }
 
-# ==========================================================
-# 初始化全局 UUID 和密码
-# ==========================================================
-
-init_global() {
-    if [[ -f "$GLOBAL" ]]; then
-        source "$GLOBAL"
-        return
-    fi
-
-    UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)"
-    PASSWORD="$(openssl rand -hex 16)"
-
-    cat > "$GLOBAL" <<EOF
-UUID='$UUID'
-PASSWORD='$PASSWORD'
-EOF
-
-    chmod 600 "$GLOBAL"
-    info "已生成全局 UUID 和密码"
-}
-
-# ==========================================================
-# 获取服务器公网 IP
-# ==========================================================
-
-get_public_ip() {
-    local ip
-    ip="$(curl -4 -fsSL --max-time 8 https://api.ipify.org || true)"
-    if [[ -z "$ip" ]]; then
-        ip="$(curl -6 -fsSL --max-time 8 https://api64.ipify.org || true)"
-    fi
-    if [[ -z "$ip" ]]; then
-        read -rp "请输入服务器公网 IP 或域名：" ip
-    fi
-    echo "$ip"
-}
-
-# ==========================================================
-# 生成 TLS 证书
-# ==========================================================
-
-create_cert() {
-    if [[ -f "$CERT_DIR/server.crt" && -f "$CERT_DIR/server.key" ]]; then
-        return
-    fi
-
-    local sni
-    read -rp "请输入 TLS SNI（默认 www.bing.com）：" sni
-    sni="${sni:-www.bing.com}"
-
-    openssl req \
-        -x509 \
-        -nodes \
-        -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-        -keyout "$CERT_DIR/server.key" \
-        -out "$CERT_DIR/server.crt" \
-        -days 3650 \
-        -subj "/CN=$sni" \
-        -addext "subjectAltName=DNS:$sni" >/dev/null 2>&1
-
-    chmod 600 "$CERT_DIR/server.key"
-    echo "$sni" > "$DATA_DIR/sni"
-    info "TLS 证书生成成功"
-}
-
-# ==========================================================
-# 节点名称处理
-# ==========================================================
-
-valid_name() {
-    [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]
-}
-
-# ==========================================================
-# 生成节点配置
-# ==========================================================
-
-generate_config() {
-    local name="$1"
-    local port="$2"
-    local mode="$3"
-    local host="${4:-}"
-    local socks_port="${5:-}"
-    local username="${6:-}"
-    local password="${7:-}"
-
-    local config="$NODE_DIR/$name/config.json"
-    local outbound
-
-    if [[ "$mode" == "socks" ]]; then
-        if [[ -n "$username" ]]; then
-            outbound="$(
-                jq -n \
-                --arg host "$host" \
-                --argjson port "$socks_port" \
-                --arg user "$username" \
-                --arg pass "$password" '
-                {
-                    type: "socks",
-                    tag: "socks-out",
-                    server: $host,
-                    server_port: $port,
-                    version: "5",
-                    username: $user,
-                    password: $pass
-                }'
-            )"
-        else
-            outbound="$(
-                jq -n \
-                --arg host "$host" \
-                --argjson port "$socks_port" '
-                {
-                    type: "socks",
-                    tag: "socks-out",
-                    server: $host,
-                    server_port: $port,
-                    version: "5"
-                }'
-            )"
+choose_port() {
+    local value default_port="${1:-22222}"
+    while true; do
+        read_value "请输入 Hysteria2 监听端口" "$default_port"
+        value="$REPLY"
+        if ! valid_port "$value"; then
+            echo "❌ 端口必须是 1-65535 的整数。"
+            continue
         fi
-    else
-        outbound='{"type":"direct","tag":"direct-out"}'
-    fi
-
-    local target
-    if [[ "$mode" == "socks" ]]; then
-        target="socks-out"
-    else
-        target="direct-out"
-    fi
-
-    local sni
-    sni="$(cat "$DATA_DIR/sni")"
-
-    jq -n \
-        --arg uuid "$UUID" \
-        --arg pass "$PASSWORD" \
-        --argjson port "$port" \
-        --arg target "$target" \
-        --argjson outbound "$outbound" \
-        --arg sni "$sni" \
-        '
-        {
-            log: {
-                level: "info",
-                timestamp: true
-            },
-            inbounds: [
-                {
-                    type: "tuic",
-                    tag: "tuic-in",
-                    listen: "0.0.0.0",
-                    listen_port: $port,
-                    users: [
-                        {
-                            name: "default",
-                            uuid: $uuid,
-                            password: $pass
-                        }
-                    ],
-                    congestion_control: "bbr",
-                    udp_relay_mode: "native",
-                    auth_timeout: "3s",
-                    zero_rtt_handshake: false,
-                    heartbeat: "10s",
-                    tls: {
-                        enabled: true,
-                        server_name: $sni,
-                        certificate_path: "/opt/tuic/cert/server.crt",
-                        key_path: "/opt/tuic/cert/server.key",
-                        alpn: ["h3"]
-                    }
-                }
-            ],
-            outbounds: [
-                $outbound,
-                {
-                    type: "direct",
-                    tag: "direct-out"
-                }
-            ],
-            route: {
-                rules: [
-                    {
-                        inbound: ["tuic-in"],
-                        action: "route",
-                        outbound: $target
-                    }
-                ],
-                final: "direct-out"
-            }
-        }
-        ' > "$config"
-
-    chmod 600 "$config"
-    "$BIN" check -c "$config"
+        if port_already_managed "$value"; then
+            echo "❌ 这个端口已经被本脚本的其他节点使用。"
+            continue
+        fi
+        if port_in_use_by_system "$value"; then
+            echo "❌ 检测到端口 $value 已被系统中的其他程序监听。"
+            continue
+        fi
+        NODE_PORT="$value"
+        return 0
+    done
 }
 
-# ==========================================================
-# 使用 nohup 管理进程 (替代 systemd)
-# ==========================================================
+write_node_config() {
+    local yaml_file="$NODE_DIR/server.yaml" addr=""
+    mkdir -p "$NODE_DIR"
+    {
+        printf 'listen: %s\n' "$(yaml_quote ":${NODE_PORT}")"
+        printf 'tls:\n  cert: %s\n  key: %s\n  alpn:\n    - %s\n' \
+            "$(yaml_quote "$CERT_FILE")" "$(yaml_quote "$KEY_FILE")" "$(yaml_quote "$ALPN")"
+        printf 'auth:\n  type: "password"\n  password: %s\n' "$(yaml_quote "$AUTH_UUID")"
+        printf 'bandwidth:\n  up: %s\n  down: %s\n' "$(yaml_quote "$UP_BANDWIDTH")" "$(yaml_quote "$DOWN_BANDWIDTH")"
+        cat <<'YAML'
+quic:
+  max_idle_timeout: "10s"
+  max_concurrent_streams: 4
+  initial_stream_receive_window: 65536
+  max_stream_receive_window: 131072
+  initial_conn_receive_window: 131072
+  max_conn_receive_window: 262144
+YAML
+        if [[ "$USE_SOCKS5" == "y" ]]; then
+            addr="$(normalize_host_port "$SOCKS_HOST" "$SOCKS_PORT")"
+            cat <<YAML
+outbounds:
+  - name: socks_proxy
+    type: socks5
+    socks5:
+      addr: $(yaml_quote "$addr")
+YAML
+            if [[ -n "$SOCKS_USER" && -n "$SOCKS_PASS" ]]; then
+                printf '      username: %s\n      password: %s\n' "$(yaml_quote "$SOCKS_USER")" "$(yaml_quote "$SOCKS_PASS")"
+            fi
+            if [[ "$PROXY_MODE" == "all_proxy" ]]; then
+                cat <<'YAML'
+acl:
+  inline:
+    - socks_proxy(all)
+YAML
+            else
+                cat <<'YAML'
+acl:
+  inline:
+    - socks_proxy(all, tcp/*)
+    - direct(all)
+YAML
+            fi
+        else
+            cat <<'YAML'
+acl:
+  inline:
+    - direct(all)
+YAML
+        fi
+    } > "$yaml_file"
+    chmod 600 "$yaml_file"
+}
+
+# -------------------- 显示信息、节点生命周期 --------------------
+get_server_ip() {
+    local ip=""
+    ip="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+    if [[ -z "$ip" ]]; then
+        ip="$(curl -6 -fsS --max-time 8 https://api64.ipify.org 2>/dev/null || true)"
+    fi
+    printf '%s' "${ip:-YOUR_SERVER_IP}"
+}
+
+print_link() {
+    local ip="$1" url_ip="$1" label="$2"
+    if [[ "$url_ip" == *:* && "$url_ip" != \[*\] ]]; then url_ip="[$url_ip]"; fi
+    printf 'hysteria2://%s@%s:%s?sni=%s&alpn=%s&insecure=1#Hy2-%s\n' \
+        "$AUTH_UUID" "$url_ip" "$NODE_PORT" "$SNI" "$ALPN" "$label"
+}
+
+node_is_running() {
+    local pid="" command_line=""
+    [[ -f "$NODE_DIR/hysteria.pid" ]] || return 1
+    IFS= read -r pid < "$NODE_DIR/hysteria.pid" || true
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    # 除了确认 PID 存在，还要核对它确实是本节点的 Hysteria 进程，避免 PID 重用后误杀其他程序。
+    if [[ -r "/proc/$pid/cmdline" ]]; then
+        command_line="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    else
+        command_line="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    fi
+    [[ "$command_line" == *"$NODE_DIR/server.yaml"* && "$command_line" == *"hysteria"* ]]
+}
+
+create_node() {
+    ensure_common_files
+    local name_value="" use_auth="n" mode_value="2" server_ip=""
+    echo ""
+    echo "创建新 Hysteria2 节点"
+    echo "节点名称只能使用英文、数字、点、下划线和短横线，例如 A、B、Tokyo-2。"
+    while true; do
+        read_value "请输入节点名称" "A"
+        name_value="$REPLY"
+        if ! valid_node_name "$name_value"; then
+            echo "❌ 名称不合法，请重新输入。"
+        elif [[ -e "$NODES_DIR/$name_value" ]]; then
+            echo "❌ 这个节点名称已经存在。"
+        else
+            break
+        fi
+    done
+    NODE_NAME="$name_value"
+    NODE_DIR="$NODES_DIR/$NODE_NAME"
+    choose_port "22222"
+
+    echo ""
+    echo "请选择这个节点的出站方式："
+    echo "1. 不使用 SOCKS5，直接从本 VPS 出口连接"
+    echo "2. 使用本机 SOCKS5（例如 127.0.0.1:1080）"
+    echo "3. 使用远程 SOCKS5"
+    while true; do
+        read_value "请输入选项" "1"
+        case "$REPLY" in
+            1) USE_SOCKS5="n"; SOCKS_HOST=""; SOCKS_USER=""; SOCKS_PASS=""; break ;;
+            2) USE_SOCKS5="y"; SOCKS_HOST="127.0.0.1"; break ;;
+            3) USE_SOCKS5="y"; read_value "请输入 SOCKS5 地址（IP 或域名；IPv6 可直接填地址）"; SOCKS_HOST="$REPLY"; [[ -n "$SOCKS_HOST" ]] && break; echo "地址不能为空。" ;;
+            *) echo "请输入 1、2 或 3。" ;;
+        esac
+    done
+
+    if [[ "$USE_SOCKS5" == "y" ]]; then
+        if [[ "$SOCKS_HOST" == "127.0.0.1" ]]; then
+            read_value "请输入本机 SOCKS5 端口" "1080"
+        else
+            read_value "请输入 SOCKS5 端口" "1080"
+        fi
+        while ! valid_port "$REPLY"; do
+            echo "❌ 端口必须是 1-65535 的整数。"
+            read_value "请输入 SOCKS5 端口" "1080"
+        done
+        SOCKS_PORT="$REPLY"
+
+        ask_yes_no "SOCKS5 是否需要用户名和密码认证" "n"
+        use_auth="$REPLY"
+        if [[ "$use_auth" == "y" ]]; then
+            while true; do
+                read_value "请输入 SOCKS5 用户名"
+                SOCKS_USER="$REPLY"
+                [[ -n "$SOCKS_USER" ]] && break
+                echo "用户名不能为空。"
+            done
+            while true; do
+                read_secret "请输入 SOCKS5 密码"
+                SOCKS_PASS="$REPLY"
+                [[ -n "$SOCKS_PASS" ]] && break
+                echo "密码不能为空。"
+            done
+        else
+            SOCKS_USER=""
+            SOCKS_PASS=""
+        fi
+
+        echo ""
+        echo "请选择代理分流模式："
+        echo "1. 仅 TCP 走代理，UDP 直连"
+        echo "2. TCP 和 UDP 都尽可能走 SOCKS5（推荐按你的需求选择）"
+        read_value "请输入选项" "2"
+        while [[ "$REPLY" != "1" && "$REPLY" != "2" ]]; do
+            echo "请输入 1 或 2。"
+            read_value "请输入选项" "2"
+        done
+        mode_value="$REPLY"
+        [[ "$mode_value" == "2" ]] && PROXY_MODE="all_proxy" || PROXY_MODE="tcp_only"
+    else
+        SOCKS_PORT="1080"
+        SOCKS_USER=""
+        SOCKS_PASS=""
+        PROXY_MODE="all_proxy"
+    fi
+
+    save_node_meta
+    write_node_config
+    echo ""
+    echo "节点配置已生成：$NODE_DIR/server.yaml"
+    echo "端口：$NODE_PORT/UDP"
+    if [[ "$USE_SOCKS5" == "y" ]]; then
+        echo "SOCKS5：$SOCKS_HOST:$SOCKS_PORT"
+        echo "模式：$PROXY_MODE"
+    else
+        echo "出站：直连 VPS"
+    fi
+    ask_yes_no "立即启动这个节点" "y"
+    if [[ "$REPLY" == "y" ]]; then
+        start_node "$NODE_NAME"
+    fi
+    server_ip="$(get_server_ip)"
+    echo ""
+    echo "✅ 节点创建完成。"
+    echo "共享 UUID：$AUTH_UUID"
+    echo "节点链接（客户端需允许不安全证书 insecure=1）："
+    print_link "$server_ip" "$NODE_NAME"
+    echo "⚠️ 请在云厂商防火墙/安全组和 VPS 防火墙中放行 UDP 端口 $NODE_PORT。"
+}
 
 start_node() {
-    local name="$1"
-    local config="$NODE_DIR/$name/config.json"
-    local pid_file="$NODE_DIR/$name/node.pid"
-    local log_file="$LOG_DIR/${name}.log"
-
-    if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
-        info "节点 $name 已在运行中"
-        return
+    local name="$1" pid=""
+    load_node "$name" || return 1
+    if [[ ! -x "$BIN_PATH" ]]; then ensure_common_files; fi
+    if node_is_running; then
+        echo "ℹ️ 节点 $NODE_NAME 已在运行，PID：$(cat "$NODE_DIR/hysteria.pid")"
+        return 0
     fi
-
-    nohup "$BIN" run -c "$config" > "$log_file" 2>&1 &
-    local pid=$!
-    echo "$pid" > "$pid_file"
-
+    rm -f "$NODE_DIR/hysteria.pid"
+    if [[ ! -f "$NODE_DIR/server.yaml" ]]; then
+        AUTH_UUID="$(cat "$AUTH_FILE")"
+        write_node_config
+    fi
+    echo "🚀 正在启动节点 $NODE_NAME（UDP/$NODE_PORT）..."
+    nohup "$BIN_PATH" server -c "$NODE_DIR/server.yaml" > "$NODE_DIR/hysteria.log" 2>&1 </dev/null &
+    pid=$!
+    printf '%s\n' "$pid" > "$NODE_DIR/hysteria.pid"
     sleep 2
     if kill -0 "$pid" 2>/dev/null; then
-        info "节点 $name 启动成功 (PID: $pid)"
+        echo "✅ 节点 $NODE_NAME 已启动，PID：$pid"
+        echo "日志：$NODE_DIR/hysteria.log"
     else
-        error "节点启动失败，请检查配置或端口冲突。查看日志：$log_file"
-        rm -f "$pid_file"
+        rm -f "$NODE_DIR/hysteria.pid"
+        echo "❌ 节点启动失败，请查看日志："
+        tail -n 60 "$NODE_DIR/hysteria.log" 2>/dev/null || true
+        return 1
     fi
 }
 
 stop_node() {
-    local name="$1"
-    local pid_file="$NODE_DIR/$name/node.pid"
-    
-    if [[ -f "$pid_file" ]]; then
-        local pid="$(cat "$pid_file")"
-        kill "$pid" 2>/dev/null || true
-        rm -f "$pid_file"
-        info "节点 $name 已停止"
-    else
-        info "节点 $name 未运行"
+    local name="$1" pid="" i
+    load_node "$name" || return 1
+    if ! node_is_running; then
+        rm -f "$NODE_DIR/hysteria.pid"
+        echo "ℹ️ 节点 $NODE_NAME 当前没有运行。"
+        return 0
     fi
+    IFS= read -r pid < "$NODE_DIR/hysteria.pid" || true
+    echo "🛑 正在停止节点 $NODE_NAME（PID：$pid）..."
+    kill "$pid" 2>/dev/null || true
+    for ((i=0; i<10; i++)); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$NODE_DIR/hysteria.pid"
+    echo "✅ 节点 $NODE_NAME 已停止。"
 }
 
 restart_node() {
     local name="$1"
-    stop_node "$name"
-    sleep 1
+    stop_node "$name" || return 1
     start_node "$name"
 }
-
-# ==========================================================
-# 生成分享链接
-# ==========================================================
-
-generate_link() {
-    local name="$1"
-    source "$NODE_DIR/$name/node.env"
-
-    local ip
-    ip="$(cat "$DATA_DIR/public_ip")"
-
-    local sni
-    sni="$(cat "$DATA_DIR/sni")"
-
-    local encoded_name
-    encoded_name="$(jq -rn --arg v "$name" '$v | @uri')"
-
-    local encoded_sni
-    encoded_sni="$(jq -rn --arg v "$sni" '$v | @uri')"
-
-    echo
-    echo "=========================================="
-    echo "节点名称：$name"
-    echo "服务器地址：$ip"
-    echo "监听端口：$PORT/UDP"
-    echo "SOCKS5：$MODE"
-    echo "=========================================="
-    echo "tuic://$UUID:$PASSWORD@$ip:$PORT?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$encoded_sni&allow_insecure=1&allowInsecure=1&insecure=1#$encoded_name"
-    echo "=========================================="
-}
-
-# ==========================================================
-# 创建节点
-# ==========================================================
-
-create_node() {
-    echo
-    echo "========== 创建 TUIC 节点 =========="
-
-    read -rp "节点名称：" name
-    if ! valid_name "$name"; then
-        error "节点名称只能使用英文、数字、下划线和横杠"
-        return
-    fi
-
-    if [[ -d "$NODE_DIR/$name" ]]; then
-        error "节点已经存在"
-        return
-    fi
-
-    read -rp "监听端口：" port
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
-        error "端口不合法"
-        return
-    fi
-
-    echo
-    echo "请选择出站方式："
-    echo "1. DIRECT 直接连接"
-    echo "2. SOCKS5 代理"
-    read -rp "选择：" choice
-
-    local mode="direct"
-    local host=""
-    local socks_port=""
-    local username=""
-    local password=""
-
-    if [[ "$choice" == "2" ]]; then
-        mode="socks"
-        read -rp "SOCKS5 地址：" host
-        read -rp "SOCKS5 端口：" socks_port
-
-        if [[ -z "$host" ]] || ! [[ "$socks_port" =~ ^[0-9]+$ ]] || (( socks_port < 1 || socks_port > 65535 )); then
-            error "SOCKS5 地址或端口不合法"
-            return
-        fi
-
-        echo
-        echo "SOCKS5 认证方式："
-        echo "1. 无认证"
-        echo "2. 用户名密码"
-        read -rp "选择：" auth
-
-        if [[ "$auth" == "2" ]]; then
-            read -rp "用户名：" username
-            read -rsp "密码：" password
-            echo
-            if [[ -z "$username" || -z "$password" ]]; then
-                error "用户名和密码不能为空"
-                return
-            fi
-        fi
-    elif [[ "$choice" != "1" ]]; then
-        error "无效选择"
-        return
-    fi
-
-    mkdir -p "$NODE_DIR/$name"
-
-    cat > "$NODE_DIR/$name/node.env" <<EOF
-PORT='$port'
-MODE='$mode'
-SOCKS_HOST='$host'
-SOCKS_PORT='$socks_port'
-SOCKS_USER='$username'
-SOCKS_PASS='$password'
-EOF
-    chmod 600 "$NODE_DIR/$name/node.env"
-
-    if ! generate_config "$name" "$port" "$mode" "$host" "${socks_port:-0}" "$username" "$password"; then
-        rm -rf "$NODE_DIR/$name"
-        error "配置生成失败"
-        return
-    fi
-
-    start_node "$name"
-    generate_link "$name"
-}
-
-# ==========================================================
-# 查看节点
-# ==========================================================
 
 list_nodes() {
-    echo
-    echo "========== 节点列表 =========="
-    local found=0
-    
-    for dir in "$NODE_DIR"/*; do
-        [[ -d "$dir" ]] || continue
-        [[ -f "$dir/node.env" ]] || continue
-        found=1
-        source "$dir/node.env"
-        
-        local name="$(basename "$dir")"
-        local status="停止"
-        
-        if [[ -f "$dir/node.pid" ]] && kill -0 "$(cat "$dir/node.pid" 2>/dev/null)" 2>/dev/null; then
+    local conf name status port proxy mode
+    shopt -s nullglob
+    local files=("$NODES_DIR"/*/node.conf)
+    shopt -u nullglob
+    if (( ${#files[@]} == 0 )); then
+        echo "目前还没有节点，请先选择‘创建新节点’。"
+        return 0
+    fi
+    printf '\n%-18s %-8s %-10s %-12s %-12s\n' '节点名称' '端口/UDP' '运行状态' 'SOCKS5' '模式'
+    printf '%-18s %-8s %-10s %-12s %-12s\n' '------------------' '--------' '----------' '------------' '------------'
+    for conf in "${files[@]}"; do
+        # shellcheck disable=SC1090
+        source "$conf"
+        name="${NODE_NAME:-$(basename "$(dirname "$conf")")}"
+        port="${NODE_PORT:-?}"
+        proxy="否"
+        [[ "${USE_SOCKS5:-n}" == "y" ]] && proxy="${SOCKS_HOST:-?}:${SOCKS_PORT:-?}"
+        mode="${PROXY_MODE:-direct}"
+        if [[ -f "$(dirname "$conf")/hysteria.pid" ]] && kill -0 "$(cat "$(dirname "$conf")/hysteria.pid" 2>/dev/null)" 2>/dev/null; then
             status="运行中"
+        else
+            status="已停止"
         fi
-
-        printf "%-15s %-10s %-10s %-10s\n" "$name" "$PORT" "$MODE" "$status"
+        printf '%-18s %-8s %-10s %-12s %-12s\n' "$name" "$port" "$status" "$proxy" "$mode"
     done
-
-    if [[ "$found" == "0" ]]; then
-        echo "目前没有节点"
-    fi
-    echo "================================"
+    echo ""
 }
 
-# ==========================================================
-# 节点选择
-# ==========================================================
-
-select_node() {
-    read -rp "请输入节点名称：" NODE
-    if [[ ! -f "$NODE_DIR/$NODE/node.env" ]]; then
-        error "节点不存在"
-        return 1
-    fi
-    return 0
+ask_node_name() {
+    read_value "请输入节点名称"
+    REPLY="$REPLY"
 }
-
-# ==========================================================
-# 节点启动、停止、重启
-# ==========================================================
-
-node_action() {
-    select_node || return
-
-    echo
-    echo "1. 启动"
-    echo "2. 停止"
-    echo "3. 重启"
-
-    read -rp "选择：" choice
-
-    case "$choice" in
-        1) start_node "$NODE" ;;
-        2) stop_node "$NODE" ;;
-        3) restart_node "$NODE" ;;
-        *) warn "无效选择" ;;
-    esac
-}
-
-# ==========================================================
-# 修改节点 SOCKS5 设置
-# ==========================================================
-
-modify_proxy() {
-    select_node || return
-    source "$NODE_DIR/$NODE/node.env"
-
-    echo
-    echo "1. DIRECT"
-    echo "2. SOCKS5"
-    read -rp "选择：" choice
-
-    local mode="direct"
-    local host=""
-    local port="0"
-    local username=""
-    local password=""
-
-    if [[ "$choice" == "2" ]]; then
-        mode="socks"
-        read -rp "SOCKS5 地址：" host
-        read -rp "SOCKS5 端口：" port
-        if [[ -z "$host" ]] || ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
-            error "代理地址或端口不合法"
-            return
-        fi
-        echo "1. 无认证"
-        echo "2. 用户名密码"
-        read -rp "选择：" auth
-        if [[ "$auth" == "2" ]]; then
-            read -rp "用户名：" username
-            read -rsp "密码：" password
-            echo
-        fi
-    elif [[ "$choice" != "1" ]]; then
-        return
-    fi
-
-    generate_config "$NODE" "$PORT" "$mode" "$host" "$port" "$username" "$password" || return
-
-    cat > "$NODE_DIR/$NODE/node.env" <<EOF
-PORT='$PORT'
-MODE='$mode'
-SOCKS_HOST='$host'
-SOCKS_PORT='$port'
-SOCKS_USER='$username'
-SOCKS_PASS='$password'
-EOF
-    chmod 600 "$NODE_DIR/$NODE/node.env"
-    restart_node "$NODE"
-    info "节点代理配置已更新"
-}
-
-# ==========================================================
-# 删除节点
-# ==========================================================
 
 delete_node() {
-    select_node || return
-    echo
-    read -rp "确认删除节点 $NODE？输入 YES 确认：" confirm
-    [[ "$confirm" == "YES" ]] || return
-
-    stop_node "$NODE"
-    rm -rf "$NODE_DIR/$NODE"
-    info "节点删除成功"
+    local name="$1" dir="$NODES_DIR/$1"
+    load_node "$name" || return 1
+    echo "即将删除节点 $NODE_NAME（端口 $NODE_PORT），这不会删除其他节点、公共 UUID 或共享证书。"
+    ask_yes_no "确认删除" "n"
+    [[ "$REPLY" == "y" ]] || { echo "已取消。"; return 0; }
+    stop_node "$name" || true
+    rm -rf -- "$dir"
+    echo "✅ 节点 $name 已删除。"
 }
-
-# ==========================================================
-# 查看日志
-# ==========================================================
 
 show_logs() {
-    select_node || return
-    local log_file="$LOG_DIR/${NODE}.log"
-    if [[ -f "$log_file" ]]; then
-        tail -n 100 "$log_file"
-    else
-        info "暂无日志"
+    local name="$1"
+    load_node "$name" || return 1
+    if [[ ! -f "$NODE_DIR/hysteria.log" ]]; then
+        echo "该节点尚无日志文件。"
+        return 0
     fi
+    echo "显示 $name 的最近日志；按 Ctrl+C 返回菜单。"
+    tail -n 100 -f "$NODE_DIR/hysteria.log"
 }
 
-# ==========================================================
-# 查看分享链接
-# ==========================================================
-
-show_link() {
-    select_node || return
-    generate_link "$NODE"
+show_uuid() {
+    ensure_uuid
+    echo "公共 Hysteria2 UUID：$AUTH_UUID"
+    echo "文件：$AUTH_FILE（权限应为 600，请勿公开分享）"
 }
 
-# ==========================================================
-# 修改全局 UUID 和密码
-# ==========================================================
+print_help() {
+    cat <<EOF
+Hysteria2 多节点管理脚本
 
-modify_auth() {
-    source "$GLOBAL"
-    echo
-    echo "当前 UUID：$UUID"
-    echo "当前密码：$PASSWORD"
-    read -rp "确认重新生成 UUID 和密码？YES：" confirm
-    [[ "$confirm" == "YES" ]] || return
+交互式菜单：
+  bash "${BASH_SOURCE[0]}"
 
-    UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)"
-    PASSWORD="$(openssl rand -hex 16)"
+命令行模式：
+  bash "${BASH_SOURCE[0]}" create
+  bash "${BASH_SOURCE[0]}" list
+  bash "${BASH_SOURCE[0]}" start <节点名>
+  bash "${BASH_SOURCE[0]}" stop <节点名>
+  bash "${BASH_SOURCE[0]}" restart <节点名>
+  bash "${BASH_SOURCE[0]}" delete <节点名>
+  bash "${BASH_SOURCE[0]}" logs <节点名>
+  bash "${BASH_SOURCE[0]}" uuid
+  bash "${BASH_SOURCE[0]}" help
 
-    cat > "$GLOBAL" <<EOF
-UUID='$UUID'
-PASSWORD='$PASSWORD'
+数据目录：${BASE_DIR}/nodes/<节点名>/
+公共 UUID：${AUTH_FILE}
+公共证书：${CERT_FILE} 和 ${KEY_FILE}
 EOF
-    chmod 600 "$GLOBAL"
-
-    for dir in "$NODE_DIR"/*; do
-        [[ -d "$dir" ]] || continue
-        [[ -f "$dir/node.env" ]] || continue
-        local name="$(basename "$dir")"
-        source "$dir/node.env"
-        generate_config "$name" "$PORT" "$MODE" "$SOCKS_HOST" "${SOCKS_PORT:-0}" "$SOCKS_USER" "$SOCKS_PASS" || continue
-        restart_node "$name"
-    done
-    info "全局认证信息已更新"
 }
-
-# ==========================================================
-# 修改公网 IP
-# ==========================================================
-
-modify_ip() {
-    echo
-    echo "当前公网地址：$(cat "$DATA_DIR/public_ip")"
-    read -rp "请输入新的公网 IP 或域名：" ip
-    if [[ -z "$ip" ]]; then
-        return
-    fi
-    echo "$ip" > "$DATA_DIR/public_ip"
-    info "公网地址已更新"
-}
-
-# ==========================================================
-# 修改 TLS SNI
-# ==========================================================
-
-modify_sni() {
-    read -rp "请输入新的 SNI：" sni
-    [[ -n "$sni" ]] || return
-
-    openssl req \
-        -x509 \
-        -nodes \
-        -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-        -keyout "$CERT_DIR/server.key" \
-        -out "$CERT_DIR/server.crt" \
-        -days 3650 \
-        -subj "/CN=$sni" \
-        -addext "subjectAltName=DNS:$sni" >/dev/null 2>&1
-
-    chmod 600 "$CERT_DIR/server.key"
-    echo "$sni" > "$DATA_DIR/sni"
-
-    for dir in "$NODE_DIR"/*; do
-        [[ -d "$dir" ]] || continue
-        [[ -f "$dir/node.env" ]] || continue
-        local name="$(basename "$dir")"
-        restart_node "$name"
-    done
-    info "SNI 和证书已更新"
-}
-
-# ==========================================================
-# 卸载
-# ==========================================================
-
-uninstall() {
-    echo
-    warn "即将卸载所有 TUIC 节点！"
-    read -rp "请输入 UNINSTALL 确认：" confirm
-    [[ "$confirm" == "UNINSTALL" ]] || return
-
-    pkill -f "$BIN" || true
-    rm -rf "$BASE"
-    echo
-    info "TUIC 数据、配置、节点和程序已彻底删除。"
-    exit 0
-}
-
-# ==========================================================
-# 主菜单
-# ==========================================================
 
 menu() {
-    echo -e "${BLUE}"
-    echo "======================================"
-    echo "          TUIC 多节点管理脚本"
-    echo "======================================"
-    echo -e "${NC}"
-
-    echo " 1. 安装 / 检查 sing-box"
-    echo " 2. 创建 TUIC 节点"
-    echo " 3. 查看所有节点"
-    echo " 4. 启动 / 停止 / 重启节点"
-    echo " 5. 修改节点 SOCKS5 设置"
-    echo " 6. 删除指定节点"
-    echo " 7. 查看节点日志"
-    echo " 8. 查看节点分享链接"
-    echo
-    echo " 9. 修改全局 UUID / 密码"
-    echo "10. 修改公网 IP"
-    echo "11. 修改 TLS SNI"
-    echo
-    echo "12. 卸载 TUIC"
-    echo " 0. 退出"
-    echo
-    echo "======================================"
-
-    read -rp "请选择操作：" choice
-
-    case "$choice" in
-        1) install_singbox ;;
-        2) create_node ;;
-        3) list_nodes ;;
-        4) node_action ;;
-        5) modify_proxy ;;
-        6) delete_node ;;
-        7) show_logs ;;
-        8) show_link ;;
-        9) modify_auth ;;
-        10) modify_ip ;;
-        11) modify_sni ;;
-        12) uninstall ;;
-        0) exit 0 ;;
-        *) warn "无效选择" ;;
-    esac
-    pause
+    local choice
+    while true; do
+        echo ""
+        echo "===================================================="
+        echo "          Hysteria2 多节点管理脚本"
+        echo "===================================================="
+        echo "1. 创建新节点"
+        echo "2. 查看所有节点"
+        echo "3. 启动指定节点"
+        echo "4. 停止指定节点"
+        echo "5. 重启指定节点"
+        echo "6. 删除指定节点"
+        echo "7. 查看节点日志"
+        echo "8. 查看公共 UUID"
+        echo "9. 退出"
+        read -r -p "请输入选项 [1-9]：" choice
+        case "$choice" in
+            1) create_node; pause_enter ;;
+            2) list_nodes; pause_enter ;;
+            3) ask_node_name; start_node "$REPLY"; pause_enter ;;
+            4) ask_node_name; stop_node "$REPLY"; pause_enter ;;
+            5) ask_node_name; restart_node "$REPLY"; pause_enter ;;
+            6) ask_node_name; delete_node "$REPLY"; pause_enter ;;
+            7) ask_node_name; show_logs "$REPLY"; pause_enter ;;
+            8) show_uuid; pause_enter ;;
+            9|q|Q) exit 0 ;;
+            *) echo "❌ 请输入 1-9 之间的选项。" ;;
+        esac
+    done
 }
 
-# ==========================================================
-# 程序入口
-# ==========================================================
+main() {
+    local cmd="${1:-menu}"
+    ensure_root
+    case "$cmd" in
+        menu) menu ;;
+        create) create_node ;;
+        list) list_nodes ;;
+        start) [[ $# -ge 2 ]] || { echo "用法：$0 start <节点名>"; exit 2; }; start_node "$2" ;;
+        stop) [[ $# -ge 2 ]] || { echo "用法：$0 stop <节点名>"; exit 2; }; stop_node "$2" ;;
+        restart) [[ $# -ge 2 ]] || { echo "用法：$0 restart <节点名>"; exit 2; }; restart_node "$2" ;;
+        delete|del|rm) [[ $# -ge 2 ]] || { echo "用法：$0 delete <节点名>"; exit 2; }; delete_node "$2" ;;
+        logs) [[ $# -ge 2 ]] || { echo "用法：$0 logs <节点名>"; exit 2; }; show_logs "$2" ;;
+        uuid) show_uuid ;;
+        help|-h|--help) print_help ;;
+        *) echo "❌ 未知命令：$cmd"; print_help; exit 2 ;;
+    esac
+}
 
-check_root
-init_dirs
-check_dependencies
-install_singbox
-init_global
+main "$@"
 
-if [[ ! -f "$DATA_DIR/public_ip" ]]; then
-    get_public_ip > "$DATA_DIR/public_ip"
-fi
-
-if [[ ! -f "$DATA_DIR/sni" ]]; then
-    create_cert
-fi
-
-while true; do
-    menu
-done
