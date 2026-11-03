@@ -28,7 +28,14 @@ bash <(curl -Ls https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python
    ⚙️ 杂项任务
       将日志更改为跟踪
 
+
+* 安装脚本
 ```
-curl -Ls https://raw.githubusercontent.com/eishare/tuic-hy2-node.js-python/main/tuic.sh | sed 's/\r$//' | bash
+bash <(curl -Ls https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/tuic.sh | sed 's/\r$//')
 ```
+* 卸载脚本
+```
+bash <(curl -Ls https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/tuic.sh | sed 's/\r$//') del
+```
+
 
