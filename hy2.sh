@@ -13,7 +13,7 @@ SCRIPT_VERSION="2.0.0"
 
 # 在线更新地址：将下面地址改成你自己仓库中 hy2.sh 的 Raw 地址
 # 例如：https://raw.githubusercontent.com/用户名/仓库名/main/hy2.sh
-UPDATE_URL="https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy2.sh"
+UPDATE_URL="https://raw.githubusercontent.com/你的用户名/你的仓库/main/hy2.sh"
 
 # 固定数据目录。旧版如果使用了自定义 HY2_BASE_DIR，卸载前需确认旧目录。
 HY2_BASE_DIR="${HY2_BASE_DIR:-/opt/hy2-multi}"
@@ -260,7 +260,10 @@ start_node(){
     load_node "$name" || return 1
     ensure_binary
     if node_is_running; then
-        touch "$NODE_DIR/autostart"; echo "节点 $name 已运行，PID：$(cat "$NODE_DIR/hysteria.pid")"; return
+        touch "$NODE_DIR/autostart"
+        echo "节点 $name 已运行，PID：$(cat "$NODE_DIR/hysteria.pid")"
+        if [[ ! -f "$SERVICE_FILE" ]]; then enable_autostart; fi
+        return
     fi
     rm -f "$NODE_DIR/hysteria.pid"
     [[ -s "$AUTH_FILE" ]] || { echo "UUID 文件不存在，请先创建节点或修复数据目录。"; return 1; }
@@ -276,6 +279,8 @@ start_node(){
     if kill -0 "$pid" 2>/dev/null; then
         touch "$NODE_DIR/autostart"
         echo "节点 $name 已启动，PID：$pid"
+        # 首个节点启动成功后自动配置开机启动，无需用户理解额外的开关选项。
+        if [[ ! -f "$SERVICE_FILE" ]]; then enable_autostart; fi
     else
         rm -f "$NODE_DIR/hysteria.pid"
         echo "启动失败，最近日志："; tail -n 50 "$NODE_DIR/hysteria.log" 2>/dev/null || true
@@ -341,7 +346,7 @@ get_server_ip(){
 print_link(){
     local ip="$1" url_ip="$1"
     [[ "$url_ip" == *:* && "$url_ip" != \[*\] ]] && url_ip="[$url_ip]"
-    printf 'hysteria2://%s@%s:%s?sni=%s&alpn=%s&insecure=1#Hy2-%s\n' "$AUTH_UUID" "$url_ip" "$NODE_PORT" "$SNI" "$ALPN" "$NODE_NAME"
+    printf 'hysteria2://%s@%s:%s?sni=%s&alpn=%s&insecure=1#%s\n' "$AUTH_UUID" "$url_ip" "$NODE_PORT" "$SNI" "$ALPN" "$NODE_NAME"
 }
 create_node(){
     ensure_common_files
@@ -572,15 +577,30 @@ uninstall_all(){
         return 1
     fi
     # 删除当前脚本文件；如果是通过管道运行则 SCRIPT_PATH 为空，不会删除其他文件。
-    if [[ -n "$SCRIPT_PATH" && -f "$SCRIPT_PATH" ]]; then rm -f -- "$SCRIPT_PATH"; fi
+    if [[ -n "$SCRIPT_PATH" && -f "$SCRIPT_PATH" ]]; then
+        if [[ "$(readlink -f /usr/local/bin/star 2>/dev/null || true)" == "$SCRIPT_PATH" ]]; then rm -f /usr/local/bin/star; fi
+        rm -f -- "$SCRIPT_PATH"
+    fi
     echo "彻底卸载完成。系统 curl、openssl 及其他程序未被删除。"
     exit 0
+}
+
+install_shortcut(){
+    # 创建 star 快捷命令，执行 star 即可打开本脚本菜单。
+    # 只有脚本以实际文件方式运行时才创建，避免把临时管道路径写入系统。
+    local target="/usr/local/bin/star"
+    if [[ -n "$SCRIPT_PATH" && -f "$SCRIPT_PATH" ]]; then
+        mkdir -p /usr/local/bin
+        ln -sfn "$SCRIPT_PATH" "$target"
+        chmod 700 "$SCRIPT_PATH" 2>/dev/null || true
+    fi
 }
 
 print_help(){
     cat <<EOF
 Hysteria2 多节点管理脚本 v${SCRIPT_VERSION}
 用法：bash $0 [命令]
+快捷打开菜单：star
 命令：
   create                 创建节点
   list                   查看节点
@@ -613,11 +633,9 @@ menu(){
         echo "7. 查看节点日志"
         echo "8. 查看公共 UUID"
         echo "9. 在线更新脚本"
-        echo "10. 设置 VPS 重启后自动启动"
-        echo "11. 取消开机自动启动"
-        echo "12. 彻底卸载"
+        echo "10. 彻底卸载"
         echo "0. 退出"
-        read -r -p "请选择 [0-12]：" choice
+        read -r -p "请选择 [0-10]：" choice
         case "$choice" in
             1) create_node; pause_enter;;
             2) list_nodes; pause_enter;;
@@ -628,19 +646,18 @@ menu(){
             7) ask_node_name; show_logs "$REPLY"; pause_enter;;
             8) show_uuid; pause_enter;;
             9) update_script; pause_enter;;
-            10) enable_autostart; pause_enter;;
-            11) disable_autostart; pause_enter;;
-            12) uninstall_all;;
+            10) uninstall_all;;
             0|q|Q) exit 0;;
-            *) echo "请输入 0-12。";;
+            *) echo "请输入 0-10。";;
         esac
     done
 }
 main(){
     ensure_root
+    install_shortcut
     local cmd="${1:-menu}"
     case "$cmd" in
-        menu) menu;;
+        menu|star) install_shortcut; menu;;
         create) create_node;;
         list) list_nodes;;
         start) [[ $# -ge 2 ]] || { echo "用法：$0 start <节点名>"; exit 2; }; start_node "$2";;
