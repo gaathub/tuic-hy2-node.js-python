@@ -13,7 +13,7 @@ SCRIPT_VERSION="2.0.0"
 
 # 在线更新地址：将下面地址改成你自己仓库中 hy2.sh 的 Raw 地址
 # 例如：https://raw.githubusercontent.com/用户名/仓库名/main/hy2.sh
-UPDATE_URL="https://raw.githubusercontent.com/你的用户名/你的仓库/main/hy2.sh"
+UPDATE_URL="https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy2.sh"
 
 # 固定数据目录。旧版如果使用了自定义 HY2_BASE_DIR，卸载前需确认旧目录。
 HY2_BASE_DIR="${HY2_BASE_DIR:-/opt/hy2-multi}"
