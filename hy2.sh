@@ -1,1178 +1,1217 @@
 #!/usr/bin/env bash
 # ============================================================
-# Hysteria2 多节点管理脚本 v2.0.3
-# 功能：多节点、每节点独立 DIRECT/SOCKS5、在线更新、自动开机启动、编号删除
-# 依赖：bash、curl、openssl；不需要 jq / Python / Docker
+# HY2 轻量化多节点管理脚本
+# 功能：DIRECT / SOCKS5 出站、多节点、共享认证、systemd 开机启动
+# 依赖：bash、curl、openssl、systemd；不需要 jq / Python / Docker
+# 支持：Debian / Ubuntu / Rocky / AlmaLinux / CentOS Stream / Fedora
 # ============================================================
 
 set -Eeuo pipefail
-umask 077
+IFS=$'\n\t'
 
-# ======================== 用户可修改区域 ========================
-SCRIPT_VERSION="2.0.3"
-UPDATE_URL="https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy2.sh"
-HY2_BASE_DIR="${HY2_BASE_DIR:-/opt/hy2-multi}"
-HYSTERIA_VERSION="${HYSTERIA_VERSION:-v2.6.5}"
-SNI="${SNI:-www.bing.com}"
-ALPN="${ALPN:-h3}"
-UP_BANDWIDTH="${UP_BANDWIDTH:-200mbps}"
-DOWN_BANDWIDTH="${DOWN_BANDWIDTH:-200mbps}"
-DEFAULT_SCRIPT_PATH="/usr/local/bin/hy2-multi"
-SHORTCUT_PATH="/usr/local/bin/star"
-SERVICE_NAME="hy2-multi.service"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
-# ===============================================================
+# -------------------------- 基础路径 --------------------------
+HY2_HOME="/opt/hy2"
+HY2_BIN="${HY2_HOME}/bin/hysteria"
+NODES_DIR="${HY2_HOME}/nodes"
+CERT_DIR="${HY2_HOME}/cert"
+DATA_DIR="${HY2_HOME}/data"
+AUTH_FILE="${DATA_DIR}/auth.password"
+SERVER_ADDR_FILE="${DATA_DIR}/server.addr"
+UPDATE_URL_FILE="${DATA_DIR}/script.raw_url"
+CERT_FILE="${CERT_DIR}/server.crt"
+KEY_FILE="${CERT_DIR}/server.key"
+SERVICE_FILE="/etc/systemd/system/hy2@.service"
+SERVICE_PREFIX="hy2@"
+SNI_HOST="www.bing.com"
 
-BASE_DIR="$HY2_BASE_DIR"
-NODES_DIR="$BASE_DIR/nodes"
-AUTH_FILE="$BASE_DIR/hy2-uuid.conf"
-CERT_FILE="$BASE_DIR/cert.pem"
-KEY_FILE="$BASE_DIR/key.pem"
-BIN_PATH="$BASE_DIR/hysteria-linux-$(uname -m 2>/dev/null | sed -E 's/x86_64/amd64/;s/aarch64/arm64/')"
+# 当前脚本文件真实路径
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
 
-# 识别真实脚本路径；过滤管道或进程替换产生的临时文件路径。
-SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
-SCRIPT_PATH=""
-case "$SCRIPT_SOURCE" in
-    /dev/fd/*|/proc/self/fd/*|/proc/*/fd/*) ;;
-    *)
-        if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]]; then
-            SCRIPT_PATH="$(readlink -f -- "$SCRIPT_SOURCE" 2>/dev/null || printf '%s' "$SCRIPT_SOURCE")"
-        fi
-        ;;
-esac
+# -------------------------- 输出函数 --------------------------
+info()    { printf '\033[36m[信息]\033[0m %s\n' "$*"; }
+ok()      { printf '\033[32m[成功]\033[0m %s\n' "$*"; }
+warn()    { printf '\033[33m[注意]\033[0m %s\n' "$*"; }
+error()   { printf '\033[31m[错误]\033[0m %s\n' "$*" >&2; }
 
-NODE_NAME=""
-NODE_DIR=""
-NODE_PORT=""
-USE_SOCKS5="n"
-SOCKS_HOST=""
-SOCKS_PORT="1080"
-SOCKS_USER=""
-SOCKS_PASS=""
-PROXY_MODE="all_proxy"
-AUTH_UUID=""
-REPLY=""
-NODE_FILE_LIST=()
+pause() {
+    echo
+    read -r -p "按回车键返回菜单..." _ || true
+}
 
-# ======================== 基础函数 ========================
-has_cmd(){ command -v "$1" >/dev/null 2>&1; }
-
-ensure_root(){
-    [[ "$(id -u)" -eq 0 ]] || {
-        echo "请使用 root 运行：bash $0"
+# -------------------------- 环境检查 --------------------------
+require_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        error "请使用 root 用户运行本脚本。"
         exit 1
-    }
-}
-
-pause_enter(){
-    [[ -t 0 ]] && { read -r -p $'\n按回车键继续...' _ || true; }
-}
-
-read_value(){
-    local prompt="$1" def="${2:-}" value=""
-    if [[ -n "$def" ]]; then
-        read -r -p "$prompt [$def]: " value
-        REPLY="${value:-$def}"
-    else
-        read -r -p "$prompt: " value
-        REPLY="$value"
     fi
 }
 
-read_secret(){
-    local value=""
-    read -r -s -p "$1: " value
-    printf '\n'
-    REPLY="$value"
-}
+require_systemd() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        error "没有检测到 systemctl。本脚本需要使用 systemd 管理节点。"
+        exit 1
+    fi
 
-ask_yes_no(){
-    local prompt="$1" def="${2:-n}" value="" hint="y/N"
-    [[ "$def" == "y" ]] && hint="Y/n"
-    while true; do
-        read -r -p "$prompt [$hint]: " value
-        value="${value:-$def}"
-        case "${value,,}" in
-            y|yes) REPLY=y; return ;;
-            n|no) REPLY=n; return ;;
-            *) echo "请输入 y 或 n。" ;;
-        esac
-    done
-}
-
-valid_port(){
-    [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
-}
-
-valid_node_name(){
-    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$ ]]
-}
-
-yaml_quote(){
-    local v="$1"
-    v="${v//\\/\\\\}"
-    v="${v//\"/\\\"}"
-    v="${v//$'\r'/}"
-    v="${v//$'\n'/\\n}"
-    printf '"%s"' "$v"
-}
-
-normalize_host_port(){
-    local host="$1" port="$2"
-    if [[ "$host" == \[*\] ]]; then
-        printf '%s:%s' "$host" "$port"
-    elif [[ "$host" == *:* ]]; then
-        printf '[%s]:%s' "$host" "$port"
-    else
-        printf '%s:%s' "$host" "$port"
+    if [[ ! -d /run/systemd/system ]]; then
+        warn "当前环境看起来不是由 systemd 启动；请在正常的 VPS 系统中运行。"
+        exit 1
     fi
 }
 
-# 搜集节点文件，并按节点目录名称排序。
-# 节点列表和编号删除共用该顺序，确保编号一致。
-collect_node_files(){
-    NODE_FILE_LIST=()
-    [[ -d "$NODES_DIR" ]] || return 0
-
-    local -a files=()
-    shopt -s nullglob
-    files=("$NODES_DIR"/*/node.conf)
-    shopt -u nullglob
-
-    if ((${#files[@]})); then
-        mapfile -t NODE_FILE_LIST < <(printf '%s\n' "${files[@]}" | LC_ALL=C sort)
-    fi
-}
-
-# ======================== 依赖管理 ========================
-install_missing_dependencies(){
+# 自动安装必要依赖
+install_missing_commands() {
     local missing=()
-    has_cmd curl || missing+=(curl)
-    has_cmd openssl || missing+=(openssl)
-    ((${#missing[@]} == 0)) && return 0
+    local cmd
 
-    echo "需要安装依赖：${missing[*]}"
-    if has_cmd apt-get; then
-        apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
-    elif has_cmd dnf; then
-        dnf install -y "${missing[@]}"
-    elif has_cmd yum; then
-        yum install -y "${missing[@]}"
-    elif has_cmd apk; then
-        apk add --no-cache "${missing[@]}"
-    elif has_cmd zypper; then
-        zypper --non-interactive install "${missing[@]}"
-    else
-        echo "找不到包管理器，请手动安装 curl 和 openssl。" >&2
-        return 1
-    fi
-}
+    for cmd in curl openssl; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing+=("$cmd")
+        fi
+    done
 
-get_arch(){
-    case "$(uname -m | tr '[:upper:]' '[:lower:]')" in
-        x86_64|amd64) echo amd64 ;;
-        aarch64|arm64) echo arm64 ;;
-        *) return 1 ;;
-    esac
-}
-
-# ======================== UUID 管理 ========================
-generate_uuid(){
-    local u=""
-    if [[ -r /proc/sys/kernel/random/uuid ]]; then
-        IFS= read -r u < /proc/sys/kernel/random/uuid || true
-    elif has_cmd uuidgen; then
-        u="$(uuidgen 2>/dev/null || true)"
-    else
-        u="$(openssl rand -hex 16)"
-        u="${u:0:8}-${u:8:4}-4${u:13:3}-8${u:17:3}-${u:20:12}"
-    fi
-    u="${u,,}"
-    [[ "$u" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return 1
-    printf '%s\n' "$u"
-}
-
-ensure_uuid(){
-    local saved=""
-    mkdir -p "$BASE_DIR"
-    [[ -f "$AUTH_FILE" ]] && IFS= read -r saved < "$AUTH_FILE" || true
-
-    if [[ "$saved" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-        AUTH_UUID="${saved,,}"
-        chmod 600 "$AUTH_FILE"
+    if ((${#missing[@]} == 0)); then
         return 0
     fi
 
-    AUTH_UUID="$(generate_uuid)"
-    printf '%s\n' "$AUTH_UUID" > "$AUTH_FILE"
-    chmod 600 "$AUTH_FILE"
-    echo "已生成公共 UUID：$AUTH_UUID"
+    info "正在安装缺少的依赖：${missing[*]}"
+
+    if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y curl openssl ca-certificates
+
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y curl openssl ca-certificates
+
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y curl openssl ca-certificates
+
+    else
+        error "无法识别包管理器，请手动安装 curl 和 openssl 后重新运行。"
+        exit 1
+    fi
 }
 
-# ======================== Hysteria2 内核 ========================
-ensure_binary(){
-    local arch name url tmp
-    arch="$(get_arch)" || {
-        echo "不支持 CPU 架构：$(uname -m)" >&2
-        return 1
-    }
+# 根据 CPU 架构选择官方 HY2 核心
+get_hy2_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64)
+            echo "amd64"
+            ;;
+        aarch64|arm64)
+            echo "arm64"
+            ;;
+        armv7l|armv7)
+            echo "arm"
+            ;;
+        i386|i686)
+            echo "386"
+            ;;
+        *)
+            error "暂不支持当前 CPU 架构：$(uname -m)"
+            return 1
+            ;;
+    esac
+}
 
-    name="hysteria-linux-${arch}"
-    BIN_PATH="$BASE_DIR/$name"
-    [[ -x "$BIN_PATH" ]] && return 0
+# -------------------------- 核心安装 / 更新 --------------------------
 
-    url="https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/${name}"
-    tmp="${BIN_PATH}.download"
-    echo "正在下载 Hysteria2 ${HYSTERIA_VERSION}..."
+install_or_update_core() {
+    local arch url tmp old_version new_version
 
-    if ! curl -fL --retry 3 --connect-timeout 30 -o "$tmp" "$url"; then
+    arch="$(get_hy2_arch)" || return 1
+
+    # 官方 latest 下载地址，不固定核心版本
+    url="https://download.hysteria.network/app/latest/hysteria-linux-${arch}"
+
+    mkdir -p "${HY2_HOME}/bin"
+
+    tmp="$(mktemp "${HY2_HOME}/bin/hysteria.tmp.XXXXXX")"
+
+    old_version="未安装"
+
+    if [[ -x "$HY2_BIN" ]]; then
+        old_version="$("$HY2_BIN" version 2>/dev/null | head -n 1 || echo 已安装)"
+    fi
+
+    info "正在从 Hysteria 官方下载地址获取最新核心..."
+    info "CPU 架构：${arch}"
+
+    if ! curl -fL --retry 3 --connect-timeout 10 --max-time 180 \
+        "$url" -o "$tmp"; then
+
         rm -f "$tmp"
-        echo "内核下载失败：$url" >&2
+        error "核心下载失败，请检查 VPS 网络后重试。"
         return 1
     fi
 
     chmod 755 "$tmp"
-    mv -f "$tmp" "$BIN_PATH"
+
+    # 检查新核心是否可以正常运行
+    if ! "$tmp" version >/dev/null 2>&1; then
+        rm -f "$tmp"
+        error "下载的文件无法正常执行，已取消替换现有核心。"
+        return 1
+    fi
+
+    # 验证通过以后才替换旧核心
+    mv -f "$tmp" "$HY2_BIN"
+    chmod 755 "$HY2_BIN"
+
+    new_version="$("$HY2_BIN" version 2>/dev/null | head -n 1 || echo 已安装)"
+
+    ok "Hysteria 核心已更新。"
+
+    echo "旧版本：${old_version}"
+    echo "新版本：${new_version}"
+
+    # 仅重启当前正在运行的节点
+    local d node_id unit
+
+    for d in "${NODES_DIR}"/node-*; do
+        [[ -d "$d" ]] || continue
+
+        node_id="${d##*/}"
+        unit="${SERVICE_PREFIX}${node_id}.service"
+
+        if systemctl is-active --quiet "$unit"; then
+            systemctl restart "$unit" || warn "节点 ${node_id} 重启失败，请查看日志。"
+        fi
+    done
 }
 
-# ======================== TLS 证书 ========================
-ensure_certificate(){
-    [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]] && {
-        chmod 600 "$KEY_FILE"
-        return 0
-    }
+# -------------------------- 初始化配置 --------------------------
 
-    echo "正在生成共享自签名证书（SNI：$SNI）..."
-    openssl req -x509 -nodes -newkey ec \
-        -pkeyopt ec_paramgen_curve:prime256v1 \
-        -days 3650 -keyout "$KEY_FILE" -out "$CERT_FILE" \
-        -subj "/CN=${SNI}" >/dev/null 2>&1
+# 生成所有节点共用的密码
+create_shared_auth() {
+    if [[ ! -s "$AUTH_FILE" ]]; then
+        openssl rand -hex 16 > "$AUTH_FILE"
+        chmod 600 "$AUTH_FILE"
+    fi
+}
+
+# 生成自签名证书
+create_self_signed_cert() {
+    if [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]]; then
+        return 0
+    fi
+
+    info "正在生成自签名 TLS 证书（SNI：${SNI_HOST}）..."
+
+    mkdir -p "$CERT_DIR"
+
+    openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
+        -keyout "$KEY_FILE" \
+        -out "$CERT_FILE" \
+        -subj "/CN=${SNI_HOST}" \
+        -addext "subjectAltName=DNS:${SNI_HOST}" >/dev/null 2>&1
 
     chmod 600 "$KEY_FILE"
     chmod 644 "$CERT_FILE"
 }
 
-ensure_common_files(){
-    ensure_root
-    install_missing_dependencies
-    mkdir -p "$NODES_DIR"
-    ensure_uuid
-    ensure_binary
-    ensure_certificate
-}
-
-# ======================== 节点配置 ========================
-save_node_meta(){
-    mkdir -p "$NODE_DIR"
-    {
-        printf 'NODE_NAME=%q\n' "$NODE_NAME"
-        printf 'NODE_PORT=%q\n' "$NODE_PORT"
-        printf 'USE_SOCKS5=%q\n' "$USE_SOCKS5"
-        printf 'SOCKS_HOST=%q\n' "$SOCKS_HOST"
-        printf 'SOCKS_PORT=%q\n' "$SOCKS_PORT"
-        printf 'SOCKS_USER=%q\n' "$SOCKS_USER"
-        printf 'SOCKS_PASS=%q\n' "$SOCKS_PASS"
-        printf 'PROXY_MODE=%q\n' "$PROXY_MODE"
-    } > "$NODE_DIR/node.conf"
-    chmod 600 "$NODE_DIR/node.conf"
-}
-
-load_node(){
-    local name="$1"
-    valid_node_name "$name" || {
-        echo "节点名称不合法。" >&2
-        return 1
-    }
-    NODE_DIR="$NODES_DIR/$name"
-    [[ -f "$NODE_DIR/node.conf" ]] || {
-        echo "找不到节点：$name" >&2
-        return 1
-    }
-    # node.conf 由脚本自身通过 printf %q 生成，且仅 root 可读写。
-    # shellcheck disable=SC1090
-    source "$NODE_DIR/node.conf"
-}
-
-port_already_managed(){
-    local wanted="$1" f p
-    shopt -s nullglob
-    for f in "$NODES_DIR"/*/node.conf; do
-        p="$( ( unset NODE_PORT; source "$f"; printf '%s' "${NODE_PORT:-}" ) )"
-        [[ "$p" == "$wanted" ]] && {
-            shopt -u nullglob
-            return 0
-        }
-    done
-    shopt -u nullglob
-    return 1
-}
-
-port_in_use(){
-    local p="$1"
-    if has_cmd ss; then
-        ss -H -lntu "sport = :$p" 2>/dev/null | grep -q .
-    elif has_cmd lsof; then
-        lsof -nP -iTCP:"$p" -iUDP:"$p" >/dev/null 2>&1
-    else
-        return 1
-    fi
-}
-
-choose_port(){
-    local v def="${1:-22222}"
-    while true; do
-        read_value "请输入 Hysteria2 监听端口（UDP）" "$def"
-        v="$REPLY"
-        if ! valid_port "$v"; then
-            echo "端口必须为 1-65535。"
-        elif port_already_managed "$v"; then
-            echo "该端口已被本脚本节点使用。"
-        elif port_in_use "$v"; then
-            echo "该端口已被系统程序占用。"
-        else
-            NODE_PORT="$v"
-            return 0
-        fi
-    done
-}
-
-write_node_config(){
-    local addr=""
-    mkdir -p "$NODE_DIR"
-    {
-        printf 'listen: %s\n' "$(yaml_quote ":${NODE_PORT}")"
-        printf 'tls:\n  cert: %s\n  key: %s\n  alpn:\n    - %s\n' \
-            "$(yaml_quote "$CERT_FILE")" "$(yaml_quote "$KEY_FILE")" "$(yaml_quote "$ALPN")"
-        printf 'auth:\n  type: "password"\n  password: %s\n' "$(yaml_quote "$AUTH_UUID")"
-        printf 'bandwidth:\n  up: %s\n  down: %s\n' \
-            "$(yaml_quote "$UP_BANDWIDTH")" "$(yaml_quote "$DOWN_BANDWIDTH")"
-
-        cat <<'YAML'
-quic:
-  max_idle_timeout: "10s"
-  max_concurrent_streams: 4
-  initial_stream_receive_window: 65536
-  max_stream_receive_window: 131072
-  initial_conn_receive_window: 131072
-  max_conn_receive_window: 262144
-YAML
-
-        if [[ "$USE_SOCKS5" == "y" ]]; then
-            addr="$(normalize_host_port "$SOCKS_HOST" "$SOCKS_PORT")"
-            cat <<YAML
-outbounds:
-  - name: socks_proxy
-    type: socks5
-    socks5:
-      addr: $(yaml_quote "$addr")
-YAML
-            if [[ -n "$SOCKS_USER" && -n "$SOCKS_PASS" ]]; then
-                printf '      username: %s\n      password: %s\n' \
-                    "$(yaml_quote "$SOCKS_USER")" "$(yaml_quote "$SOCKS_PASS")"
-            fi
-
-            if [[ "$PROXY_MODE" == "all_proxy" ]]; then
-                cat <<'YAML'
-acl:
-  inline:
-    - socks_proxy(all)
-YAML
-            else
-                cat <<'YAML'
-acl:
-  inline:
-    - socks_proxy(all, tcp/*)
-    - direct(all)
-YAML
-            fi
-        else
-            cat <<'YAML'
-acl:
-  inline:
-    - direct(all)
-YAML
-        fi
-    } > "$NODE_DIR/server.yaml"
-    chmod 600 "$NODE_DIR/server.yaml"
-}
-
-# ======================== 节点进程管理 ========================
-node_is_running(){
-    local pid="" cmd=""
-    [[ -f "$NODE_DIR/hysteria.pid" ]] || return 1
-    IFS= read -r pid < "$NODE_DIR/hysteria.pid" || true
-    [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 1
-    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-    [[ "$cmd" == *"$NODE_DIR/server.yaml"* && "$cmd" == *hysteria* ]]
-}
-
-start_node(){
-    local name="$1" pid=""
-    load_node "$name" || return 1
-    ensure_binary
-
-    if node_is_running; then
-        touch "$NODE_DIR/autostart"
-        echo "节点 $name 已经在运行，PID：$(cat "$NODE_DIR/hysteria.pid")"
-        if [[ ! -f "$SERVICE_FILE" ]]; then
-            enable_autostart
-        fi
-        return 0
-    fi
-
-    rm -f "$NODE_DIR/hysteria.pid"
-    [[ -s "$AUTH_FILE" ]] || {
-        echo "UUID 文件不存在，请先创建节点或检查数据目录。"
-        return 1
-    }
-
-    if [[ ! -f "$NODE_DIR/server.yaml" ]]; then
-        IFS= read -r AUTH_UUID < "$AUTH_FILE"
-        write_node_config
-    fi
-
-    echo "正在启动节点 $name（UDP/$NODE_PORT）..."
-    nohup "$BIN_PATH" server -c "$NODE_DIR/server.yaml" \
-        > "$NODE_DIR/hysteria.log" 2>&1 </dev/null &
-    pid=$!
-    printf '%s\n' "$pid" > "$NODE_DIR/hysteria.pid"
-    sleep 2
-
-    if kill -0 "$pid" 2>/dev/null; then
-        touch "$NODE_DIR/autostart"
-        echo "节点 $name 已启动，PID：$pid"
-        # 首次成功启动节点时自动设置 VPS 开机启动。
-        if [[ ! -f "$SERVICE_FILE" ]]; then
-            enable_autostart
-        fi
-    else
-        rm -f "$NODE_DIR/hysteria.pid"
-        echo "启动失败，最近日志："
-        tail -n 50 "$NODE_DIR/hysteria.log" 2>/dev/null || true
-        return 1
-    fi
-}
-
-stop_node(){
-    local name="$1" pid="" i cmd=""
-    load_node "$name" || return 1
-    rm -f "$NODE_DIR/autostart"
-
-    if ! node_is_running; then
-        rm -f "$NODE_DIR/hysteria.pid"
-        echo "节点 $name 当前未运行。"
-        return 0
-    fi
-
-    IFS= read -r pid < "$NODE_DIR/hysteria.pid" || true
-    echo "正在停止节点 $name（PID：$pid）..."
-    kill "$pid" 2>/dev/null || true
-
-    for ((i=0; i<10; i++)); do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 1
-    done
-
-    if kill -0 "$pid" 2>/dev/null; then
-        cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-        if [[ "$cmd" == *"$NODE_DIR/server.yaml"* ]]; then
-            kill -9 "$pid" 2>/dev/null || true
-        fi
-    fi
-
-    rm -f "$NODE_DIR/hysteria.pid"
-    echo "节点 $name 已停止。"
-}
-
-restart_node(){
-    stop_node "$1" && start_node "$1"
-}
-
-# ======================== 服务器公网 IP 和分享链接 ========================
-get_server_ip(){
-    local ip=""
-    has_cmd curl || return 1
-    ip="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
-    [[ -n "$ip" ]] || ip="$(curl -6 -fsS --max-time 8 https://api64.ipify.org 2>/dev/null || true)"
-    [[ -n "$ip" ]] || return 1
-    printf '%s' "$ip"
-}
-
-print_link(){
-    local ip="$1" url_ip="$1"
-    [[ "$url_ip" == *:* && "$url_ip" != \[*\] ]] && url_ip="[$url_ip]"
-    printf 'hysteria2://%s@%s:%s?sni=%s&alpn=%s&insecure=1#%s\n' \
-        "$AUTH_UUID" "$url_ip" "$NODE_PORT" "$SNI" "$ALPN" "$NODE_NAME"
-}
-
-# ======================== 节点列表（卡片式 + 每个节点的分享链接） ========================
-list_nodes(){
-    collect_node_files
-    if ((${#NODE_FILE_LIST[@]} == 0)); then
-        echo "目前没有节点。"
-        return 0
-    fi
-
-    local i=0 f name status proxy proxy_mode boot ip="" link_uuid=""
-    # 以下变量需要供 source node.conf 和 print_link 使用。
-    local NODE_NAME NODE_PORT USE_SOCKS5 SOCKS_HOST SOCKS_PORT PROXY_MODE NODE_DIR AUTH_UUID
-
-    if [[ -s "$AUTH_FILE" ]]; then
-        IFS= read -r link_uuid < "$AUTH_FILE" || true
-    fi
-    AUTH_UUID="$link_uuid"
-
-    echo
-    echo "========== 当前节点（共 ${#NODE_FILE_LIST[@]} 个） =========="
-
-    if [[ -n "$AUTH_UUID" ]]; then
-        if ip="$(get_server_ip)"; then
-            echo "服务器公网 IP：$ip"
-            echo "以下链接可直接复制到客户端导入："
-        else
-            ip=""
-            echo "服务器公网 IP：自动获取失败（因此暂时无法生成完整分享链接）"
-        fi
-    else
-        echo "公共 UUID 文件不存在，无法生成分享链接。"
-    fi
-
-    for f in "${NODE_FILE_LIST[@]}"; do
-        ((i+=1))
-        NODE_NAME=""
-        NODE_PORT=""
-        USE_SOCKS5="n"
-        SOCKS_HOST=""
-        SOCKS_PORT="1080"
-        PROXY_MODE="all_proxy"
-        # shellcheck disable=SC1090
-        source "$f"
-
-        name="${NODE_NAME:-$(basename "$(dirname "$f")")}"
-        NODE_DIR="$(dirname "$f")"
-
-        if node_is_running; then
-            status="运行中"
-        else
-            status="已停止"
-        fi
-
-        if [[ "${USE_SOCKS5:-n}" == "y" ]]; then
-            proxy="SOCKS5：$(normalize_host_port "$SOCKS_HOST" "$SOCKS_PORT")"
-            case "${PROXY_MODE:-all_proxy}" in
-                tcp_only) proxy_mode="仅 TCP 走代理，UDP 直连" ;;
-                *) proxy_mode="TCP/UDP 尽可能走代理" ;;
-            esac
-        else
-            proxy="DIRECT（直连）"
-            proxy_mode="不使用 SOCKS5"
-        fi
-
-        if [[ -f "$NODE_DIR/autostart" ]]; then
-            boot="是"
-        else
-            boot="否"
-        fi
-
-        printf '\n┌─ [%d] %s\n' "$i" "$name"
-        printf '│  UDP 端口：%s\n' "${NODE_PORT:-未知}"
-        printf '│  运行状态：%s\n' "$status"
-        printf '│  出口方式：%s\n' "$proxy"
-        if [[ "${USE_SOCKS5:-n}" == "y" ]]; then
-            printf '│  代理规则：%s\n' "$proxy_mode"
-        fi
-        printf '│  重启后自动启动：%s\n' "$boot"
-
-        if [[ -n "$AUTH_UUID" && -n "$ip" && -n "${NODE_PORT:-}" ]]; then
-            printf '│  分享链接：\n'
-            # 链接较长时终端可能自动换行，但内容可完整选择并复制。
-            print_link "$ip" | sed 's/^/│  /'
-        else
-            printf '│  分享链接：暂时无法生成，请检查公网 IP 和 UUID 文件。\n'
-        fi
-
-        printf '└────────────────────────────\n'
-    done
-
-    echo
-    echo "提示：再次选择菜单 2，就能重新查看并复制所有节点链接。"
-}
-
-ask_node_name(){
-    read_value "请输入节点名称"
-}
-
-# ======================== 编号选择删除节点 ========================
-delete_node(){
-    collect_node_files
-    if ((${#NODE_FILE_LIST[@]} == 0)); then
-        echo "目前没有可删除的节点。"
-        return 0
-    fi
-
-    echo
-    echo "========== 选择要删除的节点 =========="
-    local i=0 f name choice index conf dir
-    local NODE_NAME NODE_PORT USE_SOCKS5 SOCKS_HOST SOCKS_PORT PROXY_MODE NODE_DIR
-
-    for f in "${NODE_FILE_LIST[@]}"; do
-        ((i+=1))
-        NODE_NAME=""
-        NODE_PORT=""
-        # shellcheck disable=SC1090
-        source "$f"
-        name="${NODE_NAME:-$(basename "$(dirname "$f")")}"
-        printf '[%d] %-20s UDP:%s\n' "$i" "$name" "${NODE_PORT:-?}"
-    done
-
-    echo ""
-    echo "输入节点编号进行删除，输入 0 取消。"
-    read -r -p "请选择要删除的节点编号：" choice
-
-    [[ "$choice" == "0" ]] && {
-        echo "已取消删除。"
-        return 0
-    }
-
-    if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
-        echo "输入无效，请输入节点编号。"
-        return 1
-    fi
-
-    index=$((10#$choice - 1))
-    if ((index < 0 || index >= ${#NODE_FILE_LIST[@]})); then
-        echo "编号超出范围，请重新操作。"
-        return 1
-    fi
-
-    conf="${NODE_FILE_LIST[$index]}"
-    dir="$(dirname "$conf")"
-    name="$(basename "$dir")"
-    load_node "$name" || return 1
-
-    echo
-    echo "即将删除：$name"
-    echo "监听端口：UDP/$NODE_PORT"
-    echo "只会删除这个节点，不会影响其他节点、公共 UUID 和证书。"
-    ask_yes_no "确认删除此节点" n
-
-    [[ "$REPLY" == "y" ]] || {
-        echo "已取消删除。"
-        return 0
-    }
-
-    stop_node "$name" || true
-    rm -rf -- "$dir"
-    echo "节点 $name 已删除。"
-}
-
-show_logs(){
-    load_node "$1" || return 1
-    [[ -f "$NODE_DIR/hysteria.log" ]] || {
-        echo "该节点暂无日志。"
-        return 0
-    }
-    echo "按 Ctrl+C 返回菜单。"
-    tail -n 100 -f "$NODE_DIR/hysteria.log"
-}
-
-show_uuid(){
-    ensure_uuid
-    echo "公共 UUID：$AUTH_UUID"
-    echo "文件：$AUTH_FILE"
-}
-
-# ======================== 创建节点 ========================
-create_node(){
-    ensure_common_files
-    local name ip
-
-    echo "创建节点（名称仅允许英文、数字、点、下划线、短横线）。"
-    while true; do
-        read_value "节点名称" "A"
-        name="$REPLY"
-        if ! valid_node_name "$name"; then
-            echo "名称不合法。"
-        elif [[ -e "$NODES_DIR/$name" ]]; then
-            echo "节点已存在。"
-        else
-            break
-        fi
-    done
-
-    NODE_NAME="$name"
-    NODE_DIR="$NODES_DIR/$name"
-    choose_port 22222
-
-    echo "出口方式：1. DIRECT  2. 本机 SOCKS5  3. 远程 SOCKS5"
-    while true; do
-        read_value "请选择" "1"
-        case "$REPLY" in
-            1)
-                USE_SOCKS5=n
-                SOCKS_HOST=""
-                SOCKS_USER=""
-                SOCKS_PASS=""
-                break
-                ;;
-            2)
-                USE_SOCKS5=y
-                SOCKS_HOST=127.0.0.1
-                break
-                ;;
-            3)
-                USE_SOCKS5=y
-                read_value "SOCKS5 地址（域名/IP/IPv6）"
-                SOCKS_HOST="$REPLY"
-                [[ -n "$SOCKS_HOST" ]] && break
-                echo "地址不能为空。"
-                ;;
-            *) echo "请输入 1、2 或 3。" ;;
-        esac
-    done
-
-    if [[ "$USE_SOCKS5" == "y" ]]; then
-        read_value "SOCKS5 端口" 1080
-        while ! valid_port "$REPLY"; do
-            echo "端口无效。"
-            read_value "SOCKS5 端口" 1080
-        done
-        SOCKS_PORT="$REPLY"
-
-        ask_yes_no "是否需要用户名密码认证" n
-        if [[ "$REPLY" == "y" ]]; then
-            read_value "SOCKS5 用户名"
-            SOCKS_USER="$REPLY"
-            read_secret "SOCKS5 密码"
-            SOCKS_PASS="$REPLY"
-            [[ -n "$SOCKS_USER" && -n "$SOCKS_PASS" ]] || {
-                echo "用户名和密码不能为空。"
-                return 1
-            }
-        else
-            SOCKS_USER=""
-            SOCKS_PASS=""
-        fi
-
-        echo "代理模式：1. 仅 TCP 走 SOCKS5，UDP 直连  2. TCP/UDP 尽可能走 SOCKS5"
-        read_value "请选择" 2
-        while [[ "$REPLY" != "1" && "$REPLY" != "2" ]]; do
-            read_value "请输入 1 或 2" 2
-        done
-        [[ "$REPLY" == "2" ]] && PROXY_MODE=all_proxy || PROXY_MODE=tcp_only
-    else
-        SOCKS_PORT=1080
-        SOCKS_USER=""
-        SOCKS_PASS=""
-        PROXY_MODE=all_proxy
-    fi
-
-    save_node_meta
-    IFS= read -r AUTH_UUID < "$AUTH_FILE"
-    write_node_config
-
-    echo "节点配置已生成：$NODE_DIR/server.yaml"
-    if [[ "$USE_SOCKS5" == "y" ]]; then
-        echo "端口：$NODE_PORT/UDP；出口：SOCKS5 $SOCKS_HOST:$SOCKS_PORT（$PROXY_MODE）"
-    else
-        echo "端口：$NODE_PORT/UDP；出口：DIRECT"
-    fi
-
-    ask_yes_no "立即启动节点" y
-    if [[ "$REPLY" == "y" ]]; then
-        start_node "$NODE_NAME"
-    fi
-
-    ip="$(get_server_ip 2>/dev/null || true)"
-    echo
-    if [[ -n "$ip" ]]; then
-        echo "节点分享链接："
-        print_link "$ip"
-    else
-        echo "暂时无法自动获取服务器公网 IP，因此没有生成分享链接。"
-        echo "之后可在主菜单选择 2，重新查看节点链接。"
-    fi
-    echo "请在 VPS/云厂商防火墙放行 UDP $NODE_PORT。"
-}
-
-# ======================== 自动开机启动（无需单独菜单选项） ========================
-write_boot_helpers(){
-    mkdir -p "$BASE_DIR"
-
-    cat > "$BASE_DIR/start-all.sh" <<'START'
-#!/usr/bin/env bash
-set -u
-BASE="__BASE__"
-NODES="$BASE/nodes"
-BIN="__BIN__"
-shopt -s nullglob
-for conf in "$NODES"/*/node.conf; do
-    dir="$(dirname "$conf")"
-    [[ -f "$dir/autostart" && -f "$dir/server.yaml" ]] || continue
-    if [[ -f "$dir/hysteria.pid" ]]; then
-        pid="$(cat "$dir/hysteria.pid" 2>/dev/null || true)"
-        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-            cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-            [[ "$cmd" == *"$dir/server.yaml"* ]] && continue
-        fi
-    fi
-    rm -f "$dir/hysteria.pid"
-    nohup "$BIN" server -c "$dir/server.yaml" >> "$dir/hysteria.log" 2>&1 </dev/null &
-    echo "$!" > "$dir/hysteria.pid"
-done
-exit 0
-START
-
-    cat > "$BASE_DIR/stop-all.sh" <<'STOP'
-#!/usr/bin/env bash
-set -u
-BASE="__BASE__"
-NODES="$BASE/nodes"
-shopt -s nullglob
-for conf in "$NODES"/*/node.conf; do
-    dir="$(dirname "$conf")"
-    [[ -f "$dir/hysteria.pid" ]] || continue
-    pid="$(cat "$dir/hysteria.pid" 2>/dev/null || true)"
-    [[ "$pid" =~ ^[0-9]+$ ]] || { rm -f "$dir/hysteria.pid"; continue; }
-    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-    if [[ "$cmd" == *"$dir/server.yaml"* && "$cmd" == *hysteria* ]]; then
-        kill "$pid" 2>/dev/null || true
-        for _ in {1..8}; do
-            kill -0 "$pid" 2>/dev/null || break
-            sleep 1
-        done
-        if kill -0 "$pid" 2>/dev/null; then
-            cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-            [[ "$cmd" == *"$dir/server.yaml"* ]] && kill -9 "$pid" 2>/dev/null || true
-        fi
-    fi
-    rm -f "$dir/hysteria.pid"
-done
-STOP
-
-    # 将数据目录和内核路径写入辅助脚本。
-    sed -i "s|__BASE__|$BASE_DIR|g; s|__BIN__|$BIN_PATH|g" \
-        "$BASE_DIR/start-all.sh" "$BASE_DIR/stop-all.sh"
-    chmod 700 "$BASE_DIR/start-all.sh" "$BASE_DIR/stop-all.sh"
-}
-
-enable_autostart(){
-    ensure_root
-    if ! has_cmd systemctl; then
-        echo "当前系统没有 systemctl，无法配置开机自动启动。"
-        return 1
-    fi
-
-    local f dir p c
-    shopt -s nullglob
-    local configs=("$NODES_DIR"/*/node.conf)
-    shopt -u nullglob
-    ((${#configs[@]})) || {
-        echo "还没有节点，暂不设置开机启动。"
-        return 1
-    }
-
-    # 将当前正在运行的节点标记为开机自动启动。
-    for f in "${configs[@]}"; do
-        dir="$(dirname "$f")"
-        if [[ -f "$dir/hysteria.pid" ]]; then
-            p="$(cat "$dir/hysteria.pid" 2>/dev/null || true)"
-            if [[ "$p" =~ ^[0-9]+$ ]] && kill -0 "$p" 2>/dev/null; then
-                c="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null || true)"
-                [[ "$c" == *"$dir/server.yaml"* ]] && touch "$dir/autostart"
-            fi
-        fi
-    done
-
-    write_boot_helpers
+# 创建 systemd 通用节点模板
+write_systemd_template() {
     cat > "$SERVICE_FILE" <<EOF_SERVICE
 [Unit]
-Description=Hysteria2 Multi Node Auto Start
+Description=Hysteria 2 Node (%i)
 Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=oneshot
-ExecStart=/bin/bash $BASE_DIR/start-all.sh
-ExecStop=/bin/bash $BASE_DIR/stop-all.sh
-RemainAfterExit=yes
+Type=simple
+ExecStart=${HY2_BIN} server --config ${NODES_DIR}/%i/config.yaml
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
 EOF_SERVICE
 
     chmod 644 "$SERVICE_FILE"
+
     systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME"
-    systemctl start "$SERVICE_NAME" 2>/dev/null || true
-    echo "已自动配置 VPS 开机启动。"
 }
 
-# ======================== 在线更新（支持管道启动） ========================
-update_script(){
-    ensure_root
-    local target="$SCRIPT_PATH" tmp backup downloaded_version
+# 初始化环境
+initialize() {
+    require_root
+    require_systemd
+    install_missing_commands
 
-    if [[ -z "$target" || ! -f "$target" ||
-          "$target" == /dev/fd/* || "$target" == /proc/self/fd/* ||
-          "$target" == /proc/*/fd/* ]]; then
-        target="$DEFAULT_SCRIPT_PATH"
-        echo "当前通过临时管道运行，更新后的脚本将保存到：$target"
-    else
-        target="$(readlink -f -- "$target" 2>/dev/null || printf '%s' "$target")"
+    mkdir -p "${HY2_HOME}/bin" "$NODES_DIR" "$CERT_DIR" "$DATA_DIR"
+
+    chmod 700 "$HY2_HOME" "$DATA_DIR"
+
+    if [[ ! -x "$HY2_BIN" ]]; then
+        install_or_update_core
     fi
 
-    [[ -n "$UPDATE_URL" ]] || {
-        echo "更新地址为空，请检查脚本顶部 UPDATE_URL。"
-        return 1
-    }
+    create_shared_auth
+    create_self_signed_cert
+    write_systemd_template
 
-    mkdir -p "$(dirname "$target")"
-    tmp="$(mktemp "${target}.new.XXXXXX")" || {
-        echo "无法创建临时更新文件。"
-        return 1
-    }
-    backup="${target}.bak.$(date +%Y%m%d%H%M%S)"
+    # 将共享密码加载到内存
+    AUTH_PASS="$(cat "$AUTH_FILE")"
+}
 
-    echo "正在下载最新脚本..."
-    if ! curl -fL --retry 2 --connect-timeout 20 -o "$tmp" "$UPDATE_URL"; then
-        rm -f "$tmp"
-        echo "下载失败，当前脚本未更改。"
-        return 1
+# -------------------------- 地址及 URI 工具 --------------------------
+
+valid_server_addr() {
+    local value="$1"
+
+    [[ -n "$value" && "$value" != *[[:space:]/?#@]* ]]
+}
+
+# 自动获取公网 IP
+get_public_ip() {
+    local ip=""
+
+    ip="$(curl -4 -fsS --connect-timeout 5 --max-time 8 \
+        https://api.ipify.org 2>/dev/null || true)"
+
+    if [[ -z "$ip" ]]; then
+        ip="$(curl -6 -fsS --connect-timeout 5 --max-time 8 \
+            https://api64.ipify.org 2>/dev/null || true)"
     fi
 
-    if [[ ! -s "$tmp" ]]; then
-        rm -f "$tmp"
-        echo "下载文件为空，取消更新。"
-        return 1
-    fi
+    printf '%s' "$ip"
+}
 
-    echo "正在检查新脚本语法..."
-    if ! bash -n "$tmp"; then
-        rm -f "$tmp"
-        echo "新脚本语法检查失败，当前脚本未更改。"
-        return 1
-    fi
+# 第一次创建节点时设置连接地址
+ensure_server_addr() {
+    local current="" detected="" input=""
 
-    downloaded_version="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$tmp" | head -n 1)"
-    if [[ -z "$downloaded_version" ]]; then
-        rm -f "$tmp"
-        echo "未找到版本号，拒绝更新。"
-        return 1
-    fi
+    if [[ -s "$SERVER_ADDR_FILE" ]]; then
+        current="$(cat "$SERVER_ADDR_FILE")"
 
-    if [[ -f "$target" ]]; then
-        if ! cp -a "$target" "$backup"; then
-            rm -f "$tmp"
-            echo "备份旧脚本失败，取消更新。"
-            return 1
+        if valid_server_addr "$current"; then
+            return 0
         fi
-        echo "旧版本备份：$backup"
     fi
 
-    chmod 700 "$tmp"
-    if ! mv -f "$tmp" "$target"; then
-        rm -f "$tmp"
-        echo "替换失败，当前脚本未更改。"
-        [[ -f "$backup" ]] && echo "旧版本备份：$backup"
+    echo
+
+    info "请输入客户端连接 VPS 时使用的公网 IP 或域名。"
+
+    detected="$(get_public_ip)"
+
+    if [[ -n "$detected" ]]; then
+        read -r -p "连接地址 [自动检测：${detected}]：" input
+        input="${input:-$detected}"
+    else
+        warn "自动检测公网 IP 失败，请手动输入域名或 IP。"
+        read -r -p "连接地址：" input
+    fi
+
+    if ! valid_server_addr "$input"; then
+        error "连接地址为空或格式不正确。"
         return 1
     fi
 
-    SCRIPT_PATH="$target"
-    install_shortcut
-    echo
-    echo "========================================"
-    echo "              更新成功"
-    echo "========================================"
-    echo "当前版本：$downloaded_version"
-    echo "保存位置：$target"
-    echo "快捷命令：star"
-    echo "请退出当前菜单后执行 star，进入新版本。"
+    printf '%s\n' "$input" > "$SERVER_ADDR_FILE"
+    chmod 600 "$SERVER_ADDR_FILE"
+
+    ok "连接地址已保存：${input}"
 }
 
-# ======================== 彻底卸载 ========================
-uninstall_all(){
-    ensure_root
-    echo "警告：彻底卸载将删除本脚本管理的全部节点、UUID、证书、内核和配置。"
-    echo "数据目录：$BASE_DIR"
-    echo "systemd 服务：$SERVICE_NAME"
-    ask_yes_no "确定彻底卸载？此操作不可恢复" n
-    [[ "$REPLY" == "y" ]] || {
-        echo "已取消。"
-        return 0
-    }
+# IPv6 URI 格式处理
+uri_host() {
+    local host="$1"
 
-    if has_cmd systemctl; then
-        systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-        rm -f "$SERVICE_FILE"
-        systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+        printf '[%s]' "$host"
+    else
+        printf '%s' "$host"
+    fi
+}
+
+# URL 编码，处理中文、空格及特殊字符
+url_encode() {
+    local LC_ALL=C
+    local input="$1"
+    local output=""
+    local ch code i
+
+    for ((i = 0; i < ${#input}; i++)); do
+        ch="${input:i:1}"
+
+        case "$ch" in
+            [a-zA-Z0-9.~_-])
+                output+="$ch"
+                ;;
+            *)
+                printf -v code '%%%02X' "'${ch}"
+                output+="$code"
+                ;;
+        esac
+    done
+
+    printf '%s' "$output"
+}
+
+# 生成 HY2 分享链接
+make_share_link() {
+    local node_name="$1"
+    local port="$2"
+    local server_addr encoded_name
+
+    server_addr="$(cat "$SERVER_ADDR_FILE")"
+    server_addr="$(uri_host "$server_addr")"
+
+    encoded_name="$(url_encode "$node_name")"
+
+    printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=1#%s' \
+        "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$encoded_name"
+}
+
+# -------------------------- 节点管理辅助函数 --------------------------
+
+load_node_dirs() {
+    NODE_DIRS=()
+
+    local d
+
+    for d in "$NODES_DIR"/node-*; do
+        [[ -d "$d" ]] && NODE_DIRS+=("$d")
+    done
+
+    if ((${#NODE_DIRS[@]} == 0)); then
+        return 1
     fi
 
-    # 只停止本脚本目录对应的 Hysteria2 进程，不使用 pkill hysteria。
-    local conf dir pid cmd
-    shopt -s nullglob
-    local configs=("$NODES_DIR"/*/node.conf)
-    shopt -u nullglob
+    # 按 node-1、node-2、node-10 的自然顺序排列
+    mapfile -t NODE_DIRS < <(
+        printf '%s\n' "${NODE_DIRS[@]}" | sort -V
+    )
 
-    for conf in "${configs[@]}"; do
-        dir="$(dirname "$conf")"
-        [[ -f "$dir/hysteria.pid" ]] || continue
-        pid="$(cat "$dir/hysteria.pid" 2>/dev/null || true)"
-        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-            cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-            if [[ "$cmd" == *"$dir/server.yaml"* && "$cmd" == *hysteria* ]]; then
-                kill "$pid" 2>/dev/null || true
-                for _ in {1..10}; do
-                    kill -0 "$pid" 2>/dev/null || break
-                    sleep 1
-                done
-                if kill -0 "$pid" 2>/dev/null; then
-                    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-                    [[ "$cmd" == *"$dir/server.yaml"* ]] && kill -9 "$pid" 2>/dev/null || true
-                fi
+    return 0
+}
+
+# 自动分配下一个节点编号
+next_node_number() {
+    local d base number max=0
+
+    for d in "$NODES_DIR"/node-*; do
+        [[ -d "$d" ]] || continue
+
+        base="${d##*/node-}"
+
+        if [[ "$base" =~ ^[0-9]+$ ]]; then
+            number=$((10#$base))
+
+            if ((number > max)); then
+                max="$number"
             fi
         fi
     done
 
-    if [[ "$BASE_DIR" == /* && "$BASE_DIR" != "/" &&
-          "$BASE_DIR" != "/opt" && "$BASE_DIR" != "/root" ]]; then
-        rm -rf -- "$BASE_DIR"
-    else
-        echo "安全检查阻止删除异常数据目录：$BASE_DIR" >&2
+    echo $((max + 1))
+}
+
+# 检查已有节点是否使用此端口
+node_port_exists() {
+    local wanted="$1" d saved_port
+
+    for d in "$NODES_DIR"/node-*; do
+        [[ -d "$d" && -f "$d/port" ]] || continue
+
+        saved_port="$(cat "$d/port")"
+
+        [[ "$saved_port" == "$wanted" ]] && return 0
+    done
+
+    return 1
+}
+
+# 检查 UDP 端口是否已经被其他程序占用
+udp_port_is_listening() {
+    local port="$1"
+
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -lun "sport = :${port}" 2>/dev/null | grep -q .
+        return $?
+    fi
+
+    return 1
+}
+
+# 选择节点
+load_node_choice() {
+    local choice index
+
+    if ! load_node_dirs; then
+        warn "目前还没有创建任何节点。"
         return 1
     fi
 
-    local remove_script="$SCRIPT_PATH"
-    if [[ -z "$remove_script" && -f "$DEFAULT_SCRIPT_PATH" ]]; then
-        remove_script="$DEFAULT_SCRIPT_PATH"
+    echo
+    echo "节点列表："
+
+    local i d name port mode
+
+    for i in "${!NODE_DIRS[@]}"; do
+        d="${NODE_DIRS[$i]}"
+
+        name="$(cat "$d/name")"
+        port="$(cat "$d/port")"
+        mode="$(cat "$d/mode")"
+
+        printf '  %2d. %-20s  %-7s  UDP端口：%s\n' \
+            "$((i + 1))" "$name" "$mode" "$port"
+    done
+
+    read -r -p "请输入节点序号：" choice
+
+    if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
+        warn "请输入正确的数字序号。"
+        return 1
     fi
 
-    if [[ -n "$remove_script" && -f "$remove_script" ]]; then
-        if [[ "$(readlink -f "$SHORTCUT_PATH" 2>/dev/null || true)" == "$(readlink -f "$remove_script" 2>/dev/null || true)" ]]; then
-            rm -f "$SHORTCUT_PATH"
+    index=$((10#$choice))
+
+    if ((index < 1 || index > ${#NODE_DIRS[@]})); then
+        warn "序号超出范围。"
+        return 1
+    fi
+
+    SELECTED_NODE="${NODE_DIRS[$((index - 1))]}"
+
+    return 0
+}
+
+# -------------------------- 创建节点 --------------------------
+
+create_node() {
+    local node_name port default_port node_num mode_choice mode
+    local proxy_addr proxy_user proxy_pass proxy_port
+    local node_id node_dir config_file quoted_addr quoted_user quoted_pass
+    local unit
+
+    ensure_server_addr || return 1
+
+    node_num="$(next_node_number)"
+    default_port=$((20000 + node_num))
+
+    echo
+
+    read -r -p "节点名称（例如 Google、Netflix）：" node_name
+
+    if [[ -z "$node_name" || "$node_name" == */* ]]; then
+        error "节点名称不能为空，也不能包含 /。"
+        return 1
+    fi
+
+    read -r -p "UDP 监听端口 [${default_port}]：" port
+    port="${port:-$default_port}"
+
+    if [[ ! "$port" =~ ^[0-9]{1,5}$ ]]; then
+        error "端口必须是 1 到 65535 之间的数字。"
+        return 1
+    fi
+
+    port=$((10#$port))
+
+    if ((port < 1 || port > 65535)); then
+        error "端口范围必须为 1-65535。"
+        return 1
+    fi
+
+    if node_port_exists "$port"; then
+        error "本脚本已有节点使用 UDP 端口 ${port}。"
+        return 1
+    fi
+
+    if udp_port_is_listening "$port"; then
+        error "检测到 UDP 端口 ${port} 已被其他程序占用，请更换端口。"
+        return 1
+    fi
+
+    echo
+    echo "选择节点出口："
+    echo "  1. DIRECT（VPS 本机直连）"
+    echo "  2. SOCKS5（通过 SOCKS5 代理出站）"
+
+    read -r -p "请选择 [1/2]：" mode_choice
+
+    proxy_addr=""
+    proxy_user=""
+    proxy_pass=""
+
+    case "$mode_choice" in
+        1)
+            mode="DIRECT"
+            ;;
+        2)
+            mode="SOCKS5"
+
+            while true; do
+                read -r -p "SOCKS5 地址（例如 127.0.0.1:1080）：" proxy_addr
+
+                if [[ "$proxy_addr" =~ ^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+):([0-9]{1,5})$ ]]; then
+                    proxy_port="${BASH_REMATCH[2]}"
+                    proxy_port=$((10#$proxy_port))
+
+                    if ((proxy_port >= 1 && proxy_port <= 65535)); then
+                        break
+                    fi
+                fi
+
+                warn "地址格式不正确，请使用 host:port 或 [IPv6]:port。"
+            done
+
+            read -r -p "SOCKS5 用户名（无认证直接回车）：" proxy_user
+
+            if [[ -n "$proxy_user" ]]; then
+                read -r -s -p "SOCKS5 密码：" proxy_pass
+                echo
+
+                if [[ -z "$proxy_pass" ]]; then
+                    error "填写了用户名时，密码也不能为空。"
+                    return 1
+                fi
+            fi
+            ;;
+        *)
+            warn "选择无效，已取消创建。"
+            return 1
+            ;;
+    esac
+
+    node_id="node-${node_num}"
+    node_dir="${NODES_DIR}/${node_id}"
+    config_file="${node_dir}/config.yaml"
+    unit="${SERVICE_PREFIX}${node_id}.service"
+
+    mkdir -p "$node_dir"
+
+    # 所有节点共享认证密码和 TLS 证书
+    cat > "$config_file" <<EOF_CONFIG
+listen: :${port}
+
+tls:
+  cert: ${CERT_FILE}
+  key: ${KEY_FILE}
+
+auth:
+  type: password
+  password: ${AUTH_PASS}
+
+outbounds:
+  - name: node_out
+    type: ${mode,,}
+EOF_CONFIG
+
+    # SOCKS5 配置
+    if [[ "$mode" == "SOCKS5" ]]; then
+
+        quoted_addr="$(yaml_quote "$proxy_addr")"
+
+        cat >> "$config_file" <<EOF_SOCKS
+    socks5:
+      addr: ${quoted_addr}
+EOF_SOCKS
+
+        if [[ -n "$proxy_user" ]]; then
+            quoted_user="$(yaml_quote "$proxy_user")"
+            quoted_pass="$(yaml_quote "$proxy_pass")"
+
+            cat >> "$config_file" <<EOF_AUTH
+      username: ${quoted_user}
+      password: ${quoted_pass}
+EOF_AUTH
         fi
-        rm -f -- "$remove_script"
     fi
 
-    echo "彻底卸载完成。系统 curl、openssl 及其他程序未被删除。"
-    exit 0
-}
+    # 将该节点所有目标流量交给唯一 outbound
+    cat >> "$config_file" <<'EOF_ACL'
 
-# ======================== star 快捷命令 ========================
-install_shortcut(){
-    local target="$SHORTCUT_PATH"
-    if [[ -n "$SCRIPT_PATH" && -f "$SCRIPT_PATH" ]]; then
-        SCRIPT_PATH="$(readlink -f -- "$SCRIPT_PATH" 2>/dev/null || printf '%s' "$SCRIPT_PATH")"
-        mkdir -p "$(dirname "$target")"
-        ln -sfn "$SCRIPT_PATH" "$target"
-        chmod 700 "$SCRIPT_PATH" 2>/dev/null || true
+acl:
+  inline:
+    - node_out(all)
+EOF_ACL
+
+    # 保存节点元数据
+    printf '%s\n' "$node_name" > "${node_dir}/name"
+    printf '%s\n' "$port" > "${node_dir}/port"
+    printf '%s\n' "$mode" > "${node_dir}/mode"
+
+    chmod 600 "$config_file"
+    chmod 600 "${node_dir}/name" "${node_dir}/port" "${node_dir}/mode"
+
+    # 启动节点并设置开机启动
+    if ! systemctl enable --now "$unit"; then
+        error "节点服务启动命令失败，最近日志："
+        journalctl -u "$unit" -n 30 --no-pager || true
+        return 1
     fi
-}
 
-# ======================== 帮助信息 ========================
-print_help(){
-    cat <<EOF_HELP
-Hysteria2 多节点管理脚本 v${SCRIPT_VERSION}
+    sleep 1
 
-用法：bash $0 [命令]
-快捷打开菜单：star
+    if systemctl is-active --quiet "$unit"; then
 
-命令：
-  create                 创建节点
-  list                   查看所有节点及分享链接
-  start <节点名>          启动节点
-  stop <节点名>           停止节点
-  restart <节点名>        重启节点
-  delete                 进入编号选择并删除节点
-  logs <节点名>           查看日志
-  uuid                   查看公共 UUID
-  update                 在线更新脚本
-  uninstall              彻底卸载
+        ok "节点创建成功并已启动：${node_name}"
 
-说明：节点成功启动后会自动加入 VPS 开机启动。
-数据目录：$BASE_DIR
-EOF_HELP
-}
+        echo "出口类型：${mode}"
+        echo "监听端口：${port}/UDP"
+        echo "开机启动：已启用"
 
-# ======================== 主菜单 ========================
-menu(){
-    local choice
-    while true; do
         echo
-        echo "===================================================="
-        echo "       Hysteria2 多节点管理脚本 v${SCRIPT_VERSION}"
-        echo "===================================================="
-        echo "1. 创建新节点"
-        echo "2. 查看所有节点（含分享链接）"
-        echo "3. 启动指定节点"
-        echo "4. 停止指定节点"
-        echo "5. 重启指定节点"
-        echo "6. 删除节点（编号选择）"
-        echo "7. 查看节点日志"
-        echo "8. 查看公共 UUID"
-        echo "9. 在线更新脚本"
-        echo "10. 彻底卸载"
-        echo "0. 退出"
+        echo "分享链接："
 
-        read -r -p "请选择 [0-10]：" choice
-        case "$choice" in
-            1) create_node; pause_enter ;;
-            2) list_nodes; pause_enter ;;
-            3) ask_node_name; start_node "$REPLY"; pause_enter ;;
-            4) ask_node_name; stop_node "$REPLY"; pause_enter ;;
-            5) ask_node_name; restart_node "$REPLY"; pause_enter ;;
-            6) delete_node; pause_enter ;;
-            7) ask_node_name; show_logs "$REPLY"; pause_enter ;;
-            8) show_uuid; pause_enter ;;
-            9) update_script; pause_enter ;;
-            10) uninstall_all ;;
-            0|q|Q) exit 0 ;;
-            *) echo "请输入 0-10。" ;;
-        esac
+        make_share_link "$node_name" "$port"
+
+        echo
+
+        warn "请同时在 VPS 服务商防火墙/安全组放行 UDP ${port}。"
+
+        if [[ "$mode" == "SOCKS5" ]]; then
+            warn "SOCKS5 上游必须支持 UDP；否则 TCP 可能可用，但 UDP 流量无法正常转发。"
+        fi
+
+    else
+        error "节点服务未能正常启动，配置文件已保留。"
+        echo "最近日志："
+        journalctl -u "$unit" -n 30 --no-pager || true
+        return 1
+    fi
+}
+
+# YAML 双引号字符串转义
+yaml_quote() {
+    local value="$1"
+
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+
+    printf '"%s"' "$value"
+}
+
+# -------------------------- 查看节点 --------------------------
+
+list_nodes() {
+    local d node_id name port mode unit status
+
+    if ! load_node_dirs; then
+        warn "目前还没有创建任何节点。"
+        return 0
+    fi
+
+    echo
+    echo "============================== HY2 节点列表 =============================="
+
+    for d in "${NODE_DIRS[@]}"; do
+
+        node_id="${d##*/}"
+        name="$(cat "$d/name")"
+        port="$(cat "$d/port")"
+        mode="$(cat "$d/mode")"
+
+        unit="${SERVICE_PREFIX}${node_id}.service"
+
+        if systemctl is-active --quiet "$unit"; then
+            status="运行中"
+        else
+            status="已停止"
+        fi
+
+        echo
+        echo "节点：${name}（${node_id}）"
+        echo "出口：${mode}"
+        echo "状态：${status}"
+        echo "端口：${port}/UDP"
+
+        echo "链接："
+
+        make_share_link "$name" "$port"
+
+        echo
+    done
+
+    echo "========================================================================="
+}
+
+# -------------------------- 删除节点 --------------------------
+
+delete_node() {
+    local node_id name unit
+
+    if ! load_node_choice; then return 0; fi
+
+    node_id="${SELECTED_NODE##*/}"
+    name="$(cat "${SELECTED_NODE}/name")"
+    unit="${SERVICE_PREFIX}${node_id}.service"
+
+    echo
+
+    read -r -p "确定删除节点「${name}」？请输入 yes 确认：" confirm
+
+    if [[ "$confirm" != "yes" ]]; then
+        warn "已取消删除。"
+        return 0
+    fi
+
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+
+    rm -rf -- "$SELECTED_NODE"
+
+    ok "节点 ${name} 已删除。"
+
+    warn "脚本不会自动修改系统防火墙；如之前手动放行过 UDP 端口，可自行删除对应规则。"
+}
+
+# -------------------------- 批量服务管理 --------------------------
+
+start_all_nodes() {
+    local d node_id unit
+
+    if ! load_node_dirs; then
+        warn "没有可启动的节点。"
+        return 0
+    fi
+
+    for d in "${NODE_DIRS[@]}"; do
+        node_id="${d##*/}"
+        unit="${SERVICE_PREFIX}${node_id}.service"
+
+        if systemctl enable --now "$unit"; then
+            ok "已启动：${node_id}"
+        else
+            error "启动失败：${node_id}"
+        fi
     done
 }
 
-# ======================== 程序入口 ========================
-main(){
-    ensure_root
-    install_shortcut
-    local cmd="${1:-menu}"
+stop_all_nodes() {
+    local d node_id unit
 
-    case "$cmd" in
-        menu|star)
-            install_shortcut
-            menu
-            ;;
-        create) create_node ;;
-        list) list_nodes ;;
-        start)
-            [[ $# -ge 2 ]] || { echo "用法：$0 start <节点名>"; exit 2; }
-            start_node "$2"
-            ;;
-        stop)
-            [[ $# -ge 2 ]] || { echo "用法：$0 stop <节点名>"; exit 2; }
-            stop_node "$2"
-            ;;
-        restart)
-            [[ $# -ge 2 ]] || { echo "用法：$0 restart <节点名>"; exit 2; }
-            restart_node "$2"
-            ;;
-        delete|del|rm) delete_node ;;
-        logs)
-            [[ $# -ge 2 ]] || { echo "用法：$0 logs <节点名>"; exit 2; }
-            show_logs "$2"
-            ;;
-        uuid) show_uuid ;;
-        update) update_script ;;
-        uninstall) uninstall_all ;;
-        help|-h|--help) print_help ;;
-        *)
-            echo "未知命令：$cmd"
-            print_help
-            exit 2
-            ;;
-    esac
+    if ! load_node_dirs; then
+        warn "没有可停止的节点。"
+        return 0
+    fi
+
+    for d in "${NODE_DIRS[@]}"; do
+        node_id="${d##*/}"
+        unit="${SERVICE_PREFIX}${node_id}.service"
+
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+
+        info "已停止并取消开机启动：${node_id}"
+    done
+
+    ok "批量停止操作完成。"
+}
+
+restart_all_nodes() {
+    local d node_id unit
+
+    if ! load_node_dirs; then
+        warn "没有可重启的节点。"
+        return 0
+    fi
+
+    for d in "${NODE_DIRS[@]}"; do
+        node_id="${d##*/}"
+        unit="${SERVICE_PREFIX}${node_id}.service"
+
+        if systemctl enable --now "$unit"; then
+            systemctl restart "$unit" && ok "已重启：${node_id}" || error "重启失败：${node_id}"
+        else
+            error "重启失败：${node_id}"
+        fi
+    done
+}
+
+# -------------------------- 查看日志 --------------------------
+
+show_node_logs() {
+    local node_id unit
+
+    if ! load_node_choice; then return 0; fi
+
+    node_id="${SELECTED_NODE##*/}"
+    unit="${SERVICE_PREFIX}${node_id}.service"
+
+    echo
+
+    info "正在显示 ${node_id} 的实时日志，按 Ctrl+C 返回菜单。"
+
+    journalctl -u "$unit" -n 50 -f || true
+}
+
+# -------------------------- 修改 SOCKS5 出站 --------------------------
+
+update_socks_node() {
+    local node_id name port mode unit proxy_addr proxy_port proxy_user proxy_pass
+    local quoted_addr quoted_user quoted_pass tmp_config backup was_active=false
+
+    if ! load_node_choice; then return 0; fi
+
+    node_id="${SELECTED_NODE##*/}"
+    name="$(cat "${SELECTED_NODE}/name")"
+    port="$(cat "${SELECTED_NODE}/port")"
+    mode="$(cat "${SELECTED_NODE}/mode")"
+    unit="${SERVICE_PREFIX}${node_id}.service"
+
+    if [[ "$mode" != "SOCKS5" ]]; then
+        warn "所选节点「${name}」是 DIRECT 直连节点，没有 SOCKS5 配置可修改。"
+        return 0
+    fi
+
+    echo
+
+    info "正在修改节点「${name}」的 SOCKS5 上游。"
+
+    while true; do
+        read -r -p "新的 SOCKS5 地址（例如 127.0.0.1:1080）：" proxy_addr
+
+        if [[ "$proxy_addr" =~ ^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+):([0-9]{1,5})$ ]]; then
+
+            proxy_port="${BASH_REMATCH[2]}"
+            proxy_port=$((10#$proxy_port))
+
+            if ((proxy_port >= 1 && proxy_port <= 65535)); then
+                break
+            fi
+        fi
+
+        warn "地址格式不正确，请使用 host:port 或 [IPv6]:port。"
+    done
+
+    read -r -p "新的 SOCKS5 用户名（无认证直接回车）：" proxy_user
+
+    proxy_pass=""
+
+    if [[ -n "$proxy_user" ]]; then
+        read -r -s -p "新的 SOCKS5 密码：" proxy_pass
+        echo
+
+        if [[ -z "$proxy_pass" ]]; then
+            error "填写了用户名时，密码也不能为空。"
+            return 1
+        fi
+    fi
+
+    quoted_addr="$(yaml_quote "$proxy_addr")"
+
+    tmp_config="${SELECTED_NODE}/config.yaml.new"
+    backup="${SELECTED_NODE}/config.yaml.bak"
+
+    # 重新生成该节点配置
+    cat > "$tmp_config" <<EOF_UPDATE
+listen: :${port}
+
+tls:
+  cert: ${CERT_FILE}
+  key: ${KEY_FILE}
+
+auth:
+  type: password
+  password: ${AUTH_PASS}
+
+outbounds:
+  - name: node_out
+    type: socks5
+    socks5:
+      addr: ${quoted_addr}
+EOF_UPDATE
+
+    if [[ -n "$proxy_user" ]]; then
+
+        quoted_user="$(yaml_quote "$proxy_user")"
+        quoted_pass="$(yaml_quote "$proxy_pass")"
+
+        cat >> "$tmp_config" <<EOF_UPDATE_AUTH
+      username: ${quoted_user}
+      password: ${quoted_pass}
+EOF_UPDATE_AUTH
+    fi
+
+    cat >> "$tmp_config" <<'EOF_UPDATE_ACL'
+
+acl:
+  inline:
+    - node_out(all)
+EOF_UPDATE_ACL
+
+    chmod 600 "$tmp_config"
+
+    # 先备份原配置，再替换
+    cp -a "${SELECTED_NODE}/config.yaml" "$backup"
+    mv -f "$tmp_config" "${SELECTED_NODE}/config.yaml"
+
+    if systemctl is-active --quiet "$unit"; then
+
+        was_active=true
+
+        if systemctl restart "$unit" && systemctl is-active --quiet "$unit"; then
+
+            rm -f "$backup"
+
+            ok "节点「${name}」的 SOCKS5 配置已更新并重新启动。"
+
+        else
+
+            error "新配置启动失败，正在恢复旧配置..."
+
+            mv -f "$backup" "${SELECTED_NODE}/config.yaml"
+
+            systemctl restart "$unit" || true
+
+            journalctl -u "$unit" -n 30 --no-pager || true
+
+            return 1
+        fi
+
+    else
+
+        rm -f "$backup"
+
+        ok "节点「${name}」的 SOCKS5 配置已更新；该节点目前处于停止状态。"
+
+    fi
+
+    echo "新的 SOCKS5 上游：${proxy_addr}"
+
+    if [[ "$was_active" == true ]]; then
+        info "节点已恢复运行。"
+    fi
+}
+
+# -------------------------- 修改分享地址 --------------------------
+
+change_server_addr() {
+    local old_addr="" new_addr=""
+
+    [[ -s "$SERVER_ADDR_FILE" ]] && old_addr="$(cat "$SERVER_ADDR_FILE")"
+
+    read -r -p "输入新的公网 IP/域名 [当前：${old_addr}]：" new_addr
+
+    new_addr="${new_addr:-$old_addr}"
+
+    if ! valid_server_addr "$new_addr"; then
+        error "地址不能为空，也不能包含空格、路径或 URL 参数。"
+        return 1
+    fi
+
+    printf '%s\n' "$new_addr" > "$SERVER_ADDR_FILE"
+    chmod 600 "$SERVER_ADDR_FILE"
+
+    ok "分享链接地址已更新。节点服务本身无需重启。"
+
+    info "请进入「查看所有节点」重新复制分享链接。"
+}
+
+# -------------------------- 在线更新脚本 --------------------------
+
+update_script() {
+    local saved_url="" input_url="" tmp backup
+
+    if [[ -z "$SCRIPT_PATH" || ! -f "$SCRIPT_PATH" || ! -w "$SCRIPT_PATH" ]]; then
+        error "无法定位当前脚本文件。请先把脚本保存为 /root/hy2.sh，再执行它。"
+        return 1
+    fi
+
+    [[ -s "$UPDATE_URL_FILE" ]] && saved_url="$(cat "$UPDATE_URL_FILE")"
+
+    read -r -p "GitHub Raw 脚本地址 [${saved_url:-请粘贴 Raw URL}]：" input_url
+
+    input_url="${input_url:-$saved_url}"
+
+    if [[ ! "$input_url" =~ ^https:// ]]; then
+        error "请提供 https:// 开头的 GitHub Raw 地址。"
+        return 1
+    fi
+
+    tmp="$(mktemp)"
+
+    if ! curl -fL --retry 2 --connect-timeout 10 --max-time 120 "$input_url" -o "$tmp"; then
+        rm -f "$tmp"
+        error "脚本下载失败。"
+        return 1
+    fi
+
+    # 更新前进行 Bash 语法检查
+    if ! bash -n "$tmp"; then
+        rm -f "$tmp"
+        error "新脚本语法检查未通过，已保留当前脚本。"
+        return 1
+    fi
+
+    backup="${SCRIPT_PATH}.bak"
+
+    cp -a "$SCRIPT_PATH" "$backup"
+
+    install -m 755 "$tmp" "${SCRIPT_PATH}.new"
+
+    mv -f "${SCRIPT_PATH}.new" "$SCRIPT_PATH"
+
+    rm -f "$tmp"
+
+    printf '%s\n' "$input_url" > "$UPDATE_URL_FILE"
+    chmod 600 "$UPDATE_URL_FILE"
+
+    ok "脚本更新完成。旧版本备份：${backup}"
+
+    info "重新运行脚本即可使用新版本。"
+}
+
+# -------------------------- 卸载 --------------------------
+
+uninstall_all() {
+    local d node_id unit
+
+    echo
+
+    warn "卸载将停止并删除所有 HY2 节点、认证密码、证书和核心文件。"
+
+    warn "不会删除你保存的 hy2.sh 脚本文件，也不会自动清理系统/云厂商防火墙规则。"
+
+    read -r -p "确定卸载全部内容？请输入大写 YES：" confirm
+
+    if [[ "$confirm" != "YES" ]]; then
+        warn "已取消卸载。"
+        return 0
+    fi
+
+    for d in "$NODES_DIR"/node-*; do
+        [[ -d "$d" ]] || continue
+
+        node_id="${d##*/}"
+        unit="${SERVICE_PREFIX}${node_id}.service"
+
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    done
+
+    rm -f "$SERVICE_FILE"
+
+    systemctl daemon-reload
+
+    systemctl reset-failed >/dev/null 2>&1 || true
+
+    rm -rf "$HY2_HOME"
+
+    ok "HY2 管理脚本的数据、核心、节点服务及证书已卸载。"
+}
+
+# -------------------------- 主菜单 --------------------------
+
+show_menu() {
+    clear 2>/dev/null || true
+
+    echo "================================================"
+    echo "          HY2 轻量化多节点管理脚本"
+    echo "================================================"
+    echo "  1. 创建节点（DIRECT / SOCKS5）"
+    echo "  2. 查看所有节点（显示分享链接）"
+    echo "  3. 删除节点（按序号选择）"
+    echo "  4. 启动所有节点（启用开机启动）"
+    echo "  5. 停止所有节点（取消开机启动）"
+    echo "  6. 重启所有节点"
+    echo "  7. 查看节点实时日志"
+    echo "  8. 修改 SOCKS5 节点的代理配置"
+    echo "  9. 修改分享链接中的 VPS 地址"
+    echo " 10. 更新 Hysteria 2 核心（自动获取最新版）"
+    echo " 11. 在线更新本脚本（需要 GitHub Raw 地址）"
+    echo " 12. 卸载全部节点及核心"
+    echo "  0. 退出脚本"
+    echo "================================================"
+
+    if [[ -x "$HY2_BIN" ]]; then
+        printf '当前核心：%s\n' "$("$HY2_BIN" version 2>/dev/null | head -n 1 || echo 未知)"
+    fi
+
+    echo
+}
+
+# -------------------------- 主程序 --------------------------
+
+main() {
+    initialize
+
+    while true; do
+
+        show_menu
+
+        read -r -p "请输入选项 [0-12]：" choice || exit 0
+
+        case "$choice" in
+
+            1)
+                create_node
+                pause
+                ;;
+
+            2)
+                list_nodes
+                pause
+                ;;
+
+            3)
+                delete_node
+                pause
+                ;;
+
+            4)
+                start_all_nodes
+                pause
+                ;;
+
+            5)
+                stop_all_nodes
+                pause
+                ;;
+
+            6)
+                restart_all_nodes
+                pause
+                ;;
+
+            7)
+                show_node_logs
+                pause
+                ;;
+
+            8)
+                update_socks_node
+                pause
+                ;;
+
+            9)
+                change_server_addr
+                pause
+                ;;
+
+            10)
+                install_or_update_core
+                pause
+                ;;
+
+            11)
+                update_script
+                pause
+                ;;
+
+            12)
+                uninstall_all
+                exit 0
+                ;;
+
+            0)
+                exit 0
+                ;;
+
+            *)
+                warn "无效选项，请输入 0-12。"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 main "$@"
