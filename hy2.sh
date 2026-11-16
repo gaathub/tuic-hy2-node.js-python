@@ -116,67 +116,137 @@ get_hy2_arch() {
 
 # -------------------------- 核心安装 / 更新 --------------------------
 
-install_or_update_core() {
-    local arch url tmp old_version new_version
+# -------------------------- 核心安装 / 更新 --------------------------
 
+install_or_update_core() {
+
+    local arch url github_url tmp old_version new_version
+
+    # 自动识别 VPS CPU 架构
     arch="$(get_hy2_arch)" || return 1
 
-    # 官方 latest 下载地址，不固定核心版本
+    # 官方最新版下载地址
     url="https://download.hysteria.network/app/latest/hysteria-linux-${arch}"
 
+    # GitHub 官方 Releases 备用下载地址
+    # latest 表示始终获取 GitHub 当前最新发布版本
+    github_url="https://github.com/HyNetworks/hysteria/releases/latest/download/hysteria-linux-${arch}"
+
+    # 创建核心存放目录
     mkdir -p "${HY2_HOME}/bin"
 
+    # 创建临时文件，避免下载失败破坏原来的核心
     tmp="$(mktemp "${HY2_HOME}/bin/hysteria.tmp.XXXXXX")"
 
+    # 获取当前核心版本
     old_version="未安装"
 
     if [[ -x "$HY2_BIN" ]]; then
         old_version="$("$HY2_BIN" version 2>/dev/null | head -n 1 || echo 已安装)"
     fi
 
-    info "正在从 Hysteria 官方下载地址获取最新核心..."
+    echo
+    info "正在下载 Hysteria 最新核心..."
     info "CPU 架构：${arch}"
 
-    if ! curl -fL --retry 3 --connect-timeout 10 --max-time 180 \
+    # ==========================================
+    # 第一优先级：Hysteria 官方下载源
+    # ==========================================
+
+    if curl -fL \
+        --retry 2 \
+        --retry-delay 2 \
+        --connect-timeout 10 \
+        --max-time 180 \
         "$url" -o "$tmp"; then
 
+        ok "官方核心下载成功。"
+
+    else
+
+        # 官方下载源失败，删除不完整的临时文件
         rm -f "$tmp"
-        error "核心下载失败，请检查 VPS 网络后重试。"
-        return 1
+
+        warn "官方下载源连接失败，正在切换 GitHub 备用源..."
+
+        # 重新创建临时文件
+        tmp="$(mktemp "${HY2_HOME}/bin/hysteria.tmp.XXXXXX")"
+
+        # ==========================================
+        # 第二优先级：GitHub 官方 Releases
+        # ==========================================
+
+        if ! curl -fL \
+            --retry 2 \
+            --retry-delay 2 \
+            --connect-timeout 15 \
+            --max-time 180 \
+            "$github_url" -o "$tmp"; then
+
+            rm -f "$tmp"
+
+            error "官方源和 GitHub 备用源均下载失败。"
+            error "请检查 VPS 是否能够访问外网。"
+
+            return 1
+        fi
+
+        ok "GitHub 备用核心下载成功。"
+
     fi
+
+    # ==========================================
+    # 下载完成后验证核心
+    # ==========================================
 
     chmod 755 "$tmp"
 
-    # 检查新核心是否可以正常运行
-    if ! "$tmp" version >/dev/null 2>&1; then
+    if [[ ! -s "$tmp" ]] || ! "$tmp" version >/dev/null 2>&1; then
+
         rm -f "$tmp"
-        error "下载的文件无法正常执行，已取消替换现有核心。"
+
+        error "下载的核心文件验证失败。"
+        error "原有核心没有被替换。"
+
         return 1
     fi
 
-    # 验证通过以后才替换旧核心
+    # 验证通过，正式替换旧核心
     mv -f "$tmp" "$HY2_BIN"
+
     chmod 755 "$HY2_BIN"
 
+    # 获取新版本信息
     new_version="$("$HY2_BIN" version 2>/dev/null | head -n 1 || echo 已安装)"
 
-    ok "Hysteria 核心已更新。"
+    echo
+    ok "Hysteria 核心更新成功！"
 
     echo "旧版本：${old_version}"
     echo "新版本：${new_version}"
 
-    # 仅重启当前正在运行的节点
+    # ==========================================
+    # 更新后自动重启正在运行的节点
+    # ==========================================
+
     local d node_id unit
 
     for d in "${NODES_DIR}"/node-*; do
+
         [[ -d "$d" ]] || continue
 
         node_id="${d##*/}"
         unit="${SERVICE_PREFIX}${node_id}.service"
 
         if systemctl is-active --quiet "$unit"; then
-            systemctl restart "$unit" || warn "节点 ${node_id} 重启失败，请查看日志。"
+
+            info "正在重启节点：${node_id}"
+
+            systemctl restart "$unit" ||
+                warn "节点 ${node_id} 重启失败，请检查日志。"
+
         fi
+
     done
 }
 
