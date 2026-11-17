@@ -10,6 +10,9 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 # -------------------------- 基础路径 --------------------------
+# 在线更新脚本的链接地址
+SCRIPT_URL="https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy2.sh"
+
 HY2_HOME="/opt/hy2"
 HY2_BIN="${HY2_HOME}/bin/hysteria"
 NODES_DIR="${HY2_HOME}/nodes"
@@ -17,8 +20,7 @@ CERT_DIR="${HY2_HOME}/cert"
 DATA_DIR="${HY2_HOME}/data"
 AUTH_FILE="${DATA_DIR}/auth.password"
 SERVER_ADDR_FILE="${DATA_DIR}/server.addr"
-# 在线更新地址固定写入脚本，用户无需手动输入。
-SCRIPT_URL="https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy2.sh"
+
 CERT_FILE="${CERT_DIR}/server.crt"
 KEY_FILE="${CERT_DIR}/server.key"
 SERVICE_FILE="/etc/systemd/system/hy2@.service"
@@ -1776,12 +1778,12 @@ show_menu() {
     echo "  7. 查看节点实时日志"
     echo "  8. 修改 SOCKS5 节点的代理配置"
     echo "  9. 修改分享链接中的 VPS 地址"
-    echo " 10. 更新 Hysteria 2 核心（GitHub 优先，官方源备用）"
-    echo " 11. 在线更新脚本（自动获取 GitHub 最新版本）"
-    echo " 12. 深度卸载（删除脚本及全部文件）"
+    echo " 10. 更新 Hysteria 2 核心"
+    echo " 11. 在线更新脚本"
+    echo " 12. 深度卸载"
     echo " 13. 节点流量管理（统计 / 限额 / 周期重置）"
     echo "  0. 退出脚本"
-    echo "================================================"
+    echo "=============================================="
     if [[ -x "$HY2_BIN" ]]; then printf '当前核心：%s\n' "$($HY2_BIN version 2>/dev/null | head -n 1 || echo 未知)"; fi
     echo
 }
