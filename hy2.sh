@@ -17,7 +17,8 @@ CERT_DIR="${HY2_HOME}/cert"
 DATA_DIR="${HY2_HOME}/data"
 AUTH_FILE="${DATA_DIR}/auth.password"
 SERVER_ADDR_FILE="${DATA_DIR}/server.addr"
-UPDATE_URL_FILE="${DATA_DIR}/script.raw_url"
+# 在线更新地址固定写入脚本，用户无需手动输入。
+SCRIPT_URL="https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy2.sh"
 CERT_FILE="${CERT_DIR}/server.crt"
 KEY_FILE="${CERT_DIR}/server.key"
 SERVICE_FILE="/etc/systemd/system/hy2@.service"
@@ -26,7 +27,16 @@ SERVICE_PREFIX="hy2@"
 TRAFFIC_SERVICE="hy2-traffic-monitor.service"
 SNI_HOST="www.bing.com"
 MIGRATION_FILE="${DATA_DIR}/traffic_migrated_v1"
-SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+# 普通文件启动时更新当前脚本；使用 bash <(curl ...) 时，
+# BASH_SOURCE 指向 /dev/fd 或 /proc 管道，不能作为持久化脚本路径。
+SOURCE_SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+if [[ -n "$SOURCE_SCRIPT_PATH" && -f "$SOURCE_SCRIPT_PATH" &&
+      "$SOURCE_SCRIPT_PATH" != /proc/* && "$SOURCE_SCRIPT_PATH" != /dev/fd/* ]]; then
+    SCRIPT_PATH="$SOURCE_SCRIPT_PATH"
+else
+    # 进程替换启动时，将脚本安装到固定位置，供 sr 快捷命令和 systemd 监控服务调用。
+    SCRIPT_PATH="/usr/local/bin/hy2"
+fi
 
 # -------------------------- 输出函数 --------------------------
 info()    { printf '\033[36m[信息]\033[0m %s\n' "$*"; }
@@ -266,6 +276,31 @@ systemd_quote() {
     value="${value//\\/\\\\}"
     value="${value//\"/\\\"}"
     printf '"%s"' "$value"
+}
+
+# -------------------------- 持久化脚本文件 --------------------------
+ensure_persistent_script() {
+    local tmp
+    # 普通文件启动时，当前脚本已经存在，无需额外下载。
+    [[ -f "$SCRIPT_PATH" && -s "$SCRIPT_PATH" ]] && return 0
+
+    # bash <(curl ...) 启动时，原始脚本来自管道，无法可靠复制当前进程输入流。
+    # 因此首次运行时从固定 Raw 地址下载持久化副本，供快捷命令和 systemd 使用。
+    info "检测到当前通过在线命令启动，正在安装持久化脚本..."
+    tmp="$(mktemp)"
+    if ! curl -fL --retry 2 --connect-timeout 10 --max-time 120 "$SCRIPT_URL" -o "$tmp"; then
+        rm -f "$tmp"
+        error "无法下载持久化脚本。请检查 VPS 网络，或先将脚本保存为普通文件后运行。"
+        return 1
+    fi
+    if ! bash -n "$tmp"; then
+        rm -f "$tmp"
+        error "下载的脚本语法检查失败，未安装持久化副本。"
+        return 1
+    fi
+    install -m 755 "$tmp" "$SCRIPT_PATH"
+    rm -f "$tmp"
+    ok "持久化脚本已安装：${SCRIPT_PATH}"
 }
 
 # -------------------------- sr 快捷命令 --------------------------
@@ -1554,38 +1589,70 @@ traffic_management_menu() {
 
 # -------------------------- 在线更新脚本 --------------------------
 update_script() {
-    local saved_url="" input_url="" tmp backup
-    if [[ -z "$SCRIPT_PATH" || ! -f "$SCRIPT_PATH" || ! -w "$SCRIPT_PATH" ]]; then
-        error "无法定位当前脚本文件。请先把脚本保存为 /root/hy2.sh，再执行它。"
+    local tmp backup new_file
+
+    echo
+    info "正在从 GitHub 获取最新脚本..."
+    info "更新地址：${SCRIPT_URL}"
+
+    # 进程替换启动时，SCRIPT_PATH 指向 /usr/local/bin/hy2；普通文件启动时，
+    # SCRIPT_PATH 则指向用户当前运行的脚本文件。
+    if [[ -z "$SCRIPT_PATH" || "$SCRIPT_PATH" != /* ]]; then
+        error "无法确定脚本安装路径，已取消更新。"
         return 1
     fi
-    [[ -s "$UPDATE_URL_FILE" ]] && saved_url="$(cat "$UPDATE_URL_FILE")"
-    read -r -p "GitHub Raw 脚本地址 [${saved_url:-请粘贴 Raw URL}]: " input_url
-    input_url="${input_url:-$saved_url}"
-    if [[ ! "$input_url" =~ ^https:// ]]; then error "请提供 https:// 开头的 GitHub Raw 地址。"; return 1; fi
+
+    mkdir -p "$(dirname "$SCRIPT_PATH")"
     tmp="$(mktemp)"
-    if ! curl -fL --retry 2 --connect-timeout 10 --max-time 120 "$input_url" -o "$tmp"; then
+    if ! curl -fL --retry 2 --connect-timeout 10 --max-time 120 "$SCRIPT_URL" -o "$tmp"; then
         rm -f "$tmp"
-        error "脚本下载失败。"
+        error "脚本下载失败，当前版本没有发生变化。"
         return 1
     fi
-    if ! bash -n "$tmp"; then
+
+    # 防止 GitHub 返回错误页面或不完整内容时覆盖当前可用脚本。
+    if [[ ! -s "$tmp" ]] || ! bash -n "$tmp"; then
         rm -f "$tmp"
-        error "新脚本语法检查未通过，已保留当前脚本。"
+        error "新脚本为空或语法检查未通过，已保留当前版本。"
         return 1
     fi
+
     backup="${SCRIPT_PATH}.bak"
-    cp -a "$SCRIPT_PATH" "$backup"
-    install -m 755 "$tmp" "${SCRIPT_PATH}.new"
-    mv -f "${SCRIPT_PATH}.new" "$SCRIPT_PATH"
+    if [[ -f "$SCRIPT_PATH" ]]; then
+        cp -a "$SCRIPT_PATH" "$backup" || {
+            rm -f "$tmp"
+            error "无法备份当前脚本，已取消更新。"
+            return 1
+        }
+    fi
+
+    # 临时文件与目标文件位于同一目录，mv 可在同一文件系统内原子替换。
+    new_file="${SCRIPT_PATH}.new"
+    install -m 755 "$tmp" "$new_file" || {
+        rm -f "$tmp" "$new_file"
+        error "无法写入新脚本，当前版本没有发生变化。"
+        return 1
+    }
     rm -f "$tmp"
-    printf '%s\n' "$input_url" > "$UPDATE_URL_FILE"
-    chmod 600 "$UPDATE_URL_FILE"
-    ok "脚本更新完成。旧版本备份：${backup}"
+    if ! mv -f "$new_file" "$SCRIPT_PATH"; then
+        rm -f "$new_file"
+        error "替换脚本失败，旧版本仍保留。"
+        return 1
+    fi
+
+    ok "脚本在线更新成功。"
+    [[ -f "$backup" ]] && echo "旧版本备份：${backup}"
     install_shortcut
-    # 让流量监控进程加载新脚本内容。
-    systemctl restart "$TRAFFIC_SERVICE" >/dev/null 2>&1 || true
-    info "重新运行脚本即可使用新版本。"
+
+    # 流量监控服务执行的是 SCRIPT_PATH；更新后重启，使其加载新版本。
+    if systemctl is-enabled --quiet "$TRAFFIC_SERVICE" 2>/dev/null ||
+       systemctl is-active --quiet "$TRAFFIC_SERVICE" 2>/dev/null; then
+        systemctl restart "$TRAFFIC_SERVICE" >/dev/null 2>&1 ||
+            warn "流量监控服务重启失败，可稍后手动重启。"
+    fi
+
+    echo
+    info "请退出当前菜单后，输入 sr（或重新运行脚本）即可使用新版本。"
 }
 
 # -------------------------- 深度卸载 --------------------------
@@ -1683,6 +1750,7 @@ initialize() {
     install_missing_commands
     mkdir -p "${HY2_HOME}/bin" "$NODES_DIR" "$CERT_DIR" "$DATA_DIR"
     chmod 700 "$HY2_HOME" "$DATA_DIR"
+    ensure_persistent_script || exit 1
     if [[ ! -x "$HY2_BIN" ]]; then install_or_update_core; fi
     create_shared_auth
     create_self_signed_cert
@@ -1709,7 +1777,7 @@ show_menu() {
     echo "  8. 修改 SOCKS5 节点的代理配置"
     echo "  9. 修改分享链接中的 VPS 地址"
     echo " 10. 更新 Hysteria 2 核心（GitHub 优先，官方源备用）"
-    echo " 11. 在线更新本脚本（需要 GitHub Raw 地址）"
+    echo " 11. 在线更新脚本（自动获取 GitHub 最新版本）"
     echo " 12. 深度卸载（删除脚本及全部文件）"
     echo " 13. 节点流量管理（统计 / 限额 / 周期重置）"
     echo "  0. 退出脚本"
