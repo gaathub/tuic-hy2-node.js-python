@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # HY2 轻量化多节点管理脚本（增强版）
-# 功能：DIRECT / SOCKS5、多节点、共享认证、证书 SHA256 固定校验、开机自启、流量统计及限额
+# 功能：DIRECT / SOCKS5、多节点、共享认证、开机自启、流量统计及限额
 # 依赖：bash、curl、openssl、systemd、awk、grep、sed；不需要 jq / Python / Docker
 # 支持：Debian / Ubuntu / Rocky / AlmaLinux / CentOS Stream / Fedora
 # ============================================================
@@ -23,8 +23,7 @@ SERVER_ADDR_FILE="${DATA_DIR}/server.addr"
 
 CERT_FILE="${CERT_DIR}/server.crt"
 KEY_FILE="${CERT_DIR}/server.key"
-# 所有 HY2 节点共用同一张证书，因此也共用同一个 SHA256 指纹。
-CERT_FINGERPRINT_FILE="${CERT_DIR}/server.sha256"
+FINGERPRINT_FILE="${CERT_DIR}/server.sha256"
 CERT_FINGERPRINT=""
 SERVICE_FILE="/etc/systemd/system/hy2@.service"
 TRAFFIC_SERVICE_FILE="/etc/systemd/system/hy2-traffic-monitor.service"
@@ -239,73 +238,50 @@ create_shared_auth() {
     fi
 }
 
-create_self_signed_cert() {
-    local cert_pub key_pub fingerprint tmp_fingerprint
-
+# 计算并保存服务器证书的 SHA256 指纹。
+# 使用 OpenSSL 标准格式（大写十六进制，字节之间以冒号分隔）。
+save_cert_fingerprint() {
+    local fingerprint
     mkdir -p "$CERT_DIR"
 
-    # 兼容旧版本：如果原来的证书和私钥已经存在，直接沿用，绝不重新签发。
-    # 这可以保证在线更新脚本后，已有节点仍然使用原证书，不会因指纹变化而断连。
-    if [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]]; then
-        info "检测到已有 TLS 证书，直接复用，不重新生成证书。"
-    elif [[ -e "$CERT_FILE" || -e "$KEY_FILE" ]]; then
-        # 只存在证书或私钥其中一个时，不能贸然生成新证书覆盖旧文件。
-        error "检测到证书或私钥文件不完整："
-        error "证书：${CERT_FILE}"
-        error "私钥：${KEY_FILE}"
-        error "为避免更换旧证书，请先恢复匹配的 server.crt 和 server.key。"
+    if [[ ! -s "$CERT_FILE" ]]; then
+        error "证书文件不存在，无法计算 SHA256 指纹：${CERT_FILE}"
         return 1
-    else
+    fi
+
+    fingerprint="$(openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha256 2>/dev/null | sed 's/^[^=]*=//')"
+    if [[ ! "$fingerprint" =~ ^([A-Fa-f0-9]{2}:){31}[A-Fa-f0-9]{2}$ ]]; then
+        error "无法从证书中解析有效的 SHA256 指纹。"
+        return 1
+    fi
+
+    printf '%s\n' "$fingerprint" > "$FINGERPRINT_FILE"
+    chmod 600 "$FINGERPRINT_FILE"
+    CERT_FINGERPRINT="$fingerprint"
+}
+
+create_self_signed_cert() {
+    mkdir -p "$CERT_DIR"
+
+    # 已有证书和私钥时直接沿用，在线更新脚本不会重新生成证书。
+    if [[ ! -s "$CERT_FILE" || ! -s "$KEY_FILE" ]]; then
         info "正在生成自签名 TLS 证书（SNI：${SNI_HOST}）..."
-        if ! openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
+        openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
             -keyout "$KEY_FILE" -out "$CERT_FILE" \
-            -subj "/CN=${SNI_HOST}" -addext "subjectAltName=DNS:${SNI_HOST}" >/dev/null 2>&1; then
-            rm -f "$CERT_FILE" "$KEY_FILE"
-            error "TLS 证书生成失败。"
-            return 1
-        fi
+            -subj "/CN=${SNI_HOST}" -addext "subjectAltName=DNS:${SNI_HOST}" >/dev/null 2>&1 || {
+                error "TLS 证书生成失败。"
+                return 1
+            }
         chmod 600 "$KEY_FILE"
         chmod 644 "$CERT_FILE"
+        ok "TLS 证书生成成功。"
+    else
+        info "检测到已有 TLS 证书，继续使用旧证书，不重新生成。"
     fi
 
-    # 确认旧证书和私钥均可正常读取，并且确实属于同一组密钥。
-    if ! openssl x509 -in "$CERT_FILE" -noout >/dev/null 2>&1; then
-        error "证书文件无法解析：${CERT_FILE}"
-        return 1
-    fi
-    if ! openssl pkey -in "$KEY_FILE" -noout >/dev/null 2>&1; then
-        error "私钥文件无法解析：${KEY_FILE}"
-        return 1
-    fi
-
-    cert_pub="$(openssl x509 -in "$CERT_FILE" -pubkey -noout 2>/dev/null)" || return 1
-    key_pub="$(openssl pkey -in "$KEY_FILE" -pubout 2>/dev/null)" || return 1
-    if [[ -z "$cert_pub" || "$cert_pub" != "$key_pub" ]]; then
-        error "证书与私钥不匹配。为避免更换旧证书，脚本不会自动重新生成。"
-        return 1
-    fi
-
-    # 无论是旧证书还是新证书，均确保私钥权限安全。
-    chmod 600 "$KEY_FILE"
-    chmod 644 "$CERT_FILE"
-
-    # 计算证书本身的 SHA256 指纹，并规范为小写、无冒号的 64 位十六进制字符串。
-    # Hysteria2 的 pinSHA256 链接参数使用的就是该证书指纹。
-    fingerprint="$(openssl x509 -noout -fingerprint -sha256 -in "$CERT_FILE" 2>/dev/null | \
-        awk -F= 'NF >= 2 { print $NF }' | tr -d ':' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-    if [[ ! "$fingerprint" =~ ^[a-f0-9]{64}$ ]]; then
-        error "无法从证书中计算有效的 SHA256 指纹。"
-        return 1
-    fi
-
-    # 每次初始化都根据实际证书重新计算并更新指纹文件，避免沿用过期的指纹缓存。
-    tmp_fingerprint="$(mktemp "${CERT_DIR}/server.sha256.tmp.XXXXXX")" || return 1
-    printf '%s\n' "$fingerprint" > "$tmp_fingerprint"
-    chmod 600 "$tmp_fingerprint"
-    mv -f "$tmp_fingerprint" "$CERT_FINGERPRINT_FILE"
-
-    CERT_FINGERPRINT="$fingerprint"
-    ok "TLS 证书 SHA256 指纹已保存：${CERT_FINGERPRINT_FILE}"
+    # 每次启动时都从实际证书重新计算，兼容旧版本没有指纹文件的安装。
+    save_cert_fingerprint || return 1
+    ok "证书 SHA256 指纹：${CERT_FINGERPRINT}"
 }
 
 # -------------------------- systemd 节点模板 --------------------------
@@ -737,22 +713,24 @@ url_encode() {
 }
 
 make_share_link() {
-    local node_name="$1" port="$2" server_addr encoded_name fingerprint
+    local node_name="$1" port="$2" server_addr encoded_name encoded_pin
     server_addr="$(cat "$SERVER_ADDR_FILE")"
     server_addr="$(uri_host "$server_addr")"
     encoded_name="$(url_encode "$node_name")"
 
-    # 优先使用初始化时计算好的值；必要时从证书目录中的指纹文件读取。
-    fingerprint="${CERT_FINGERPRINT:-$(read_node_value "$CERT_FINGERPRINT_FILE" '')}"
-    if [[ ! "$fingerprint" =~ ^[a-fA-F0-9]{64}$ ]]; then
-        error "证书 SHA256 指纹缺失或格式错误，无法生成安全分享链接。"
+    # 所有节点共用同一张证书，因此所有节点使用同一个指纹。
+    if [[ -z "${CERT_FINGERPRINT:-}" ]]; then
+        CERT_FINGERPRINT="$(cat "$FINGERPRINT_FILE" 2>/dev/null || true)"
+    fi
+    if [[ -z "${CERT_FINGERPRINT:-}" ]]; then
+        error "证书指纹不存在，无法生成分享链接。"
         return 1
     fi
+    encoded_pin="$(url_encode "$CERT_FINGERPRINT")"
 
-    # 自签名证书需要 insecure=1 跳过系统 CA 链验证，再由 pinSHA256 精确校验证书指纹。
-    # 如果设置 insecure=0，自签名证书会因不受系统信任而被客户端拒绝。
+    # 使用 insecure=1，并通过 pinSHA256 校验服务器证书指纹。
     printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=1&pinSHA256=%s#%s' \
-        "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$fingerprint" "$encoded_name"
+        "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$encoded_pin" "$encoded_name"
 }
 
 # -------------------------- 节点列表及选择 --------------------------
@@ -1661,8 +1639,6 @@ traffic_management_menu() {
 }
 
 # -------------------------- 在线更新脚本 --------------------------
-# 在线更新只替换脚本文件，不删除或重建 /opt/hy2/cert/ 下的证书、私钥和指纹。
-# 更新后的初始化流程会复用已有 server.crt/server.key，并重新计算其 SHA256 指纹。
 update_script() {
     local tmp backup new_file
 
