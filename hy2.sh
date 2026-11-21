@@ -9,25 +9,6 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-# -------------------------- UTF-8 中文输出环境 --------------------------
-# 尽量为不同 VPS 系统统一使用 UTF-8 locale，减少中文处理时的编码差异。
-# 注意：终端软件本身也必须使用 UTF-8 编码；locale 无法修复终端自身的错误解码。
-set_utf8_locale() {
-    local available candidate
-    command -v locale >/dev/null 2>&1 || return 0
-    available="$(locale -a 2>/dev/null || true)"
-
-    for candidate in C.UTF-8 C.utf8 en_US.UTF-8 zh_CN.UTF-8; do
-        if grep -Fxiq "$candidate" <<< "$available"; then
-            export LANG="$candidate"
-            export LC_ALL="$candidate"
-            return 0
-        fi
-    done
-    return 0
-}
-set_utf8_locale
-
 # -------------------------- 基础路径 --------------------------
 # 在线更新脚本的链接地址
 SCRIPT_URL="https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy2.sh"
