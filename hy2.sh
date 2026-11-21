@@ -23,8 +23,7 @@ SERVER_ADDR_FILE="${DATA_DIR}/server.addr"
 
 CERT_FILE="${CERT_DIR}/server.crt"
 KEY_FILE="${CERT_DIR}/server.key"
-FINGERPRINT_FILE="${CERT_DIR}/server.sha256"
-CERT_FINGERPRINT=""
+CERT_SHA256_FILE="${CERT_DIR}/server.sha256"
 SERVICE_FILE="/etc/systemd/system/hy2@.service"
 TRAFFIC_SERVICE_FILE="/etc/systemd/system/hy2-traffic-monitor.service"
 SERVICE_PREFIX="hy2@"
@@ -238,50 +237,36 @@ create_shared_auth() {
     fi
 }
 
-# 计算并保存服务器证书的 SHA256 指纹。
-# 使用 OpenSSL 标准格式（大写十六进制，字节之间以冒号分隔）。
-save_cert_fingerprint() {
-    local fingerprint
+create_self_signed_cert() {
+    [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]] && return 0
+    info "正在生成自签名 TLS 证书（SNI：${SNI_HOST}）..."
     mkdir -p "$CERT_DIR"
-
-    if [[ ! -s "$CERT_FILE" ]]; then
-        error "证书文件不存在，无法计算 SHA256 指纹：${CERT_FILE}"
-        return 1
-    fi
-
-    fingerprint="$(openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha256 2>/dev/null | sed 's/^[^=]*=//')"
-    if [[ ! "$fingerprint" =~ ^([A-Fa-f0-9]{2}:){31}[A-Fa-f0-9]{2}$ ]]; then
-        error "无法从证书中解析有效的 SHA256 指纹。"
-        return 1
-    fi
-
-    printf '%s\n' "$fingerprint" > "$FINGERPRINT_FILE"
-    chmod 600 "$FINGERPRINT_FILE"
-    CERT_FINGERPRINT="$fingerprint"
+    openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
+        -keyout "$KEY_FILE" -out "$CERT_FILE" \
+        -subj "/CN=${SNI_HOST}" -addext "subjectAltName=DNS:${SNI_HOST}" >/dev/null 2>&1
+    chmod 600 "$KEY_FILE"
+    chmod 644 "$CERT_FILE"
 }
 
-create_self_signed_cert() {
-    mkdir -p "$CERT_DIR"
+# 计算当前服务器证书的 SHA-256 指纹。
+# 保留 OpenSSL 输出的冒号分隔格式，供 Hysteria2 URI 的 pinSHA256 参数使用。
+ensure_cert_fingerprint() {
+    local fingerprint
+    [[ -s "$CERT_FILE" ]] || {
+        error "TLS 证书不存在，无法计算 SHA-256 指纹。"
+        return 1
+    }
 
-    # 已有证书和私钥时直接沿用，在线更新脚本不会重新生成证书。
-    if [[ ! -s "$CERT_FILE" || ! -s "$KEY_FILE" ]]; then
-        info "正在生成自签名 TLS 证书（SNI：${SNI_HOST}）..."
-        openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
-            -keyout "$KEY_FILE" -out "$CERT_FILE" \
-            -subj "/CN=${SNI_HOST}" -addext "subjectAltName=DNS:${SNI_HOST}" >/dev/null 2>&1 || {
-                error "TLS 证书生成失败。"
-                return 1
-            }
-        chmod 600 "$KEY_FILE"
-        chmod 644 "$CERT_FILE"
-        ok "TLS 证书生成成功。"
-    else
-        info "检测到已有 TLS 证书，继续使用旧证书，不重新生成。"
+    fingerprint="$(openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha256 2>/dev/null |
+        sed 's/^[^=]*=//')"
+
+    if [[ ! "$fingerprint" =~ ^([[:xdigit:]]{2}:){31}[[:xdigit:]]{2}$ ]]; then
+        error "TLS 证书指纹计算失败，证书可能已损坏。"
+        return 1
     fi
 
-    # 每次启动时都从实际证书重新计算，兼容旧版本没有指纹文件的安装。
-    save_cert_fingerprint || return 1
-    ok "证书 SHA256 指纹：${CERT_FINGERPRINT}"
+    printf '%s\n' "$fingerprint" > "$CERT_SHA256_FILE"
+    chmod 600 "$CERT_SHA256_FILE"
 }
 
 # -------------------------- systemd 节点模板 --------------------------
@@ -713,24 +698,21 @@ url_encode() {
 }
 
 make_share_link() {
-    local node_name="$1" port="$2" server_addr encoded_name encoded_pin
+    local node_name="$1" port="$2" server_addr encoded_name fingerprint
     server_addr="$(cat "$SERVER_ADDR_FILE")"
     server_addr="$(uri_host "$server_addr")"
     encoded_name="$(url_encode "$node_name")"
+    fingerprint="$(read_node_value "$CERT_SHA256_FILE" '')"
 
-    # 所有节点共用同一张证书，因此所有节点使用同一个指纹。
-    if [[ -z "${CERT_FINGERPRINT:-}" ]]; then
-        CERT_FINGERPRINT="$(cat "$FINGERPRINT_FILE" 2>/dev/null || true)"
-    fi
-    if [[ -z "${CERT_FINGERPRINT:-}" ]]; then
-        error "证书指纹不存在，无法生成分享链接。"
+    if [[ -z "$fingerprint" ]]; then
+        error "证书 SHA-256 指纹不存在，请重新运行脚本初始化。"
         return 1
     fi
-    encoded_pin="$(url_encode "$CERT_FINGERPRINT")"
 
-    # 使用 insecure=1，并通过 pinSHA256 校验服务器证书指纹。
-    printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=1&pinSHA256=%s#%s' \
-        "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$encoded_pin" "$encoded_name"
+    # 自签名证书不再使用 insecure=1 裸连接；
+    # insecure=0 + pinSHA256 可让客户端固定校验当前服务器证书。
+    printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=0&pinSHA256=%s#%s' \
+        "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$fingerprint" "$encoded_name"
 }
 
 # -------------------------- 节点列表及选择 --------------------------
@@ -1703,14 +1685,12 @@ update_script() {
     fi
 
     echo
-    ok "脚本更新完成，正在自动重启管理菜单并加载新版本..."
+    ok "正在自动重新启动管理脚本，以加载刚更新的版本..."
+    sleep 1
 
-    # 用新脚本替换当前进程，不再要求用户手动退出、重新输入 sr。
-    # exec 成功后当前旧版本进程会被新版本进程取代。
-    if ! exec bash "$SCRIPT_PATH"; then
-        error "自动重启失败，请手动执行：bash '$SCRIPT_PATH'"
-        return 1
-    fi
+    # 用新脚本替换当前管理进程；不会重复启动旧版本菜单。
+    # initialize() 会重新加载配置，并确保快捷命令及流量监控服务使用新版本。
+    exec /bin/bash "$SCRIPT_PATH"
 }
 
 # -------------------------- 深度卸载 --------------------------
@@ -1812,6 +1792,7 @@ initialize() {
     if [[ ! -x "$HY2_BIN" ]]; then install_or_update_core; fi
     create_shared_auth
     create_self_signed_cert
+    ensure_cert_fingerprint || exit 1
     write_systemd_template
     AUTH_PASS="$(cat "$AUTH_FILE")"
     install_shortcut
