@@ -708,6 +708,9 @@ print_link() {
     link="tuic://${UUID}:${PASSWORD}@${link_ip}:${NODE_PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${SNI}&allow_insecure=1#${NODE_NAME}"
     printf '%s\n' "$link"
     print_qr "$link"
+    echo
+    echo "Clash Meta 配置（自签证书兼容）："
+    printf '  - name: %s\n    type: tuic\n    server: %s\n    port: %s\n    uuid: %s\n    password: %s\n    sni: %s\n    skip-cert-verify: true\n    alpn:\n      - h3\n    congestion-controller: bbr\n    udp-relay-mode: native\n' "$NODE_NAME" "$PUBLIC_IP" "$NODE_PORT" "$UUID" "$PASSWORD" "$SNI"
     echo "================================================"
 }
 
