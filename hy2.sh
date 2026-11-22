@@ -11,7 +11,7 @@ IFS=$'\n\t'
 
 # -------------------------- 基础路径 --------------------------
 # 在线更新脚本的链接地址
-SCRIPT_URL="https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy2.sh"
+SCRIPT_URL=""
 
 HY2_HOME="/opt/hy2"
 HY2_BIN="${HY2_HOME}/bin/hysteria"
@@ -23,7 +23,10 @@ SERVER_ADDR_FILE="${DATA_DIR}/server.addr"
 
 CERT_FILE="${CERT_DIR}/server.crt"
 KEY_FILE="${CERT_DIR}/server.key"
-CERT_SHA256_FILE="${CERT_DIR}/server.sha256"
+# 证书指纹固定：把证书 SHA-256 写入分享链接的 pinSHA256 参数，
+# 客户端只要握手时证书不匹配就直接断开，不再无条件信任自签名证书。
+CERT_SHA256_FILE="${CERT_DIR}/server.crt.sha256"
+CERT_SHA256=""
 SERVICE_FILE="/etc/systemd/system/hy2@.service"
 TRAFFIC_SERVICE_FILE="/etc/systemd/system/hy2-traffic-monitor.service"
 SERVICE_PREFIX="hy2@"
@@ -40,6 +43,8 @@ else
     # 进程替换启动时，将脚本安装到固定位置，供 sr 快捷命令和 systemd 监控服务调用。
     SCRIPT_PATH="/usr/local/bin/hy2"
 fi
+# 记录脚本启动参数，在线更新后重启脚本时原样传回，避免丢失调用参数。
+SCRIPT_ARGS=("$@")
 
 # -------------------------- 输出函数 --------------------------
 info()    { printf '\033[36m[信息]\033[0m %s\n' "$*"; }
@@ -246,27 +251,50 @@ create_self_signed_cert() {
         -subj "/CN=${SNI_HOST}" -addext "subjectAltName=DNS:${SNI_HOST}" >/dev/null 2>&1
     chmod 600 "$KEY_FILE"
     chmod 644 "$CERT_FILE"
+    # 证书是新生成的，旧的缓存指纹必须一并作废，否则分享链接会带上过期指纹。
+    rm -f -- "$CERT_SHA256_FILE"
 }
 
-# 计算当前服务器证书的 SHA-256 指纹。
-# 保留 OpenSSL 输出的冒号分隔格式，供 Hysteria2 URI 的 pinSHA256 参数使用。
-ensure_cert_fingerprint() {
-    local fingerprint
-    [[ -s "$CERT_FILE" ]] || {
-        error "TLS 证书不存在，无法计算 SHA-256 指纹。"
-        return 1
-    }
-
-    fingerprint="$(openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha256 2>/dev/null |
-        sed 's/^[^=]*=//')"
-
-    if [[ ! "$fingerprint" =~ ^([[:xdigit:]]{2}:){31}[[:xdigit:]]{2}$ ]]; then
-        error "TLS 证书指纹计算失败，证书可能已损坏。"
-        return 1
+# 计算证书 DER 编码的 SHA-256，输出小写十六进制。
+# Hysteria2 的 pinSHA256 就是把服务端证书链的第一张证书按 DER 做 SHA-256：
+# 十六进制、小写，不带冒号。这里与客户端实现保持完全一致。
+compute_cert_sha256() {
+    local digest=""
+    [[ -s "$CERT_FILE" ]] || return 1
+    if command -v openssl >/dev/null 2>&1; then
+        # 不同 OpenSSL 版本的输出格式不同，先去掉 “SHA256 Fingerprint=” 前缀，
+        # 再统一去掉冒号和空白，最后转成小写。
+        digest="$(openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha256 2>/dev/null |
+            sed -e 's/^.*=//' -e 's/[[:space:]]//g' -e 's/://g' |
+            tr 'A-Z' 'a-z' || true)"
     fi
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "$digest"
+}
 
-    printf '%s\n' "$fingerprint" > "$CERT_SHA256_FILE"
-    chmod 600 "$CERT_SHA256_FILE"
+# 启动时读取并缓存证书指纹。每次都从当前证书重新计算，证书被手动替换后
+# 分享链接也不会继续使用旧指纹；只有 openssl 暂时不可用时才回退到有效缓存。
+load_cert_sha256() {
+    local cached="" computed=""
+    if computed="$(compute_cert_sha256)"; then
+        if [[ ! -s "$CERT_SHA256_FILE" ]] ||
+           [[ "$(tr -d '[:space:]' < "$CERT_SHA256_FILE" 2>/dev/null | tr 'A-Z' 'a-z' || true)" != "$computed" ]]; then
+            printf '%s\n' "$computed" > "$CERT_SHA256_FILE"
+            chmod 644 "$CERT_SHA256_FILE"
+        fi
+        CERT_SHA256="$computed"
+        return 0
+    fi
+    if [[ -s "$CERT_SHA256_FILE" ]]; then
+        cached="$(tr -d '[:space:]' < "$CERT_SHA256_FILE" 2>/dev/null | tr 'A-Z' 'a-z' || true)"
+        if [[ "$cached" =~ ^[0-9a-f]{64}$ ]]; then
+            CERT_SHA256="$cached"
+            warn "当前无法读取证书，暂时使用已缓存的 SHA-256 指纹。"
+            return 0
+        fi
+    fi
+    warn "无法计算证书 SHA-256 指纹；分享链接将不带 pinSHA256 参数。"
+    return 1
 }
 
 # -------------------------- systemd 节点模板 --------------------------
@@ -698,21 +726,15 @@ url_encode() {
 }
 
 make_share_link() {
-    local node_name="$1" port="$2" server_addr encoded_name fingerprint
+    local node_name="$1" port="$2" server_addr encoded_name pin=""
     server_addr="$(cat "$SERVER_ADDR_FILE")"
     server_addr="$(uri_host "$server_addr")"
     encoded_name="$(url_encode "$node_name")"
-    fingerprint="$(read_node_value "$CERT_SHA256_FILE" '')"
-
-    if [[ -z "$fingerprint" ]]; then
-        error "证书 SHA-256 指纹不存在，请重新运行脚本初始化。"
-        return 1
-    fi
-
-    # 自签名证书不再使用 insecure=1 裸连接；
-    # insecure=0 + pinSHA256 可让客户端固定校验当前服务器证书。
-    printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=0&pinSHA256=%s#%s' \
-        "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$fingerprint" "$encoded_name"
+    # 每次生成链接都核对当前证书，避免证书被替换后仍输出旧指纹。
+    load_cert_sha256 >/dev/null 2>&1 || true
+    [[ "$CERT_SHA256" =~ ^[0-9a-f]{64}$ ]] && pin="&pinSHA256=${CERT_SHA256}"
+    printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=1%s#%s' \
+        "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$pin" "$encoded_name"
 }
 
 # -------------------------- 节点列表及选择 --------------------------
@@ -1324,19 +1346,142 @@ restart_all_nodes() {
 }
 
 # -------------------------- 删除节点 --------------------------
-delete_node() {
-    local node_id name unit confirm
-    load_node_choice || return 0
-    node_id="${SELECTED_NODE##*/}"
-    name="$(read_node_value "$SELECTED_NODE/name" "$node_id")"
-    unit="${SERVICE_PREFIX}${node_id}.service"
-    read -r -p "确定删除节点「${name}」？请输入 yes 确认: " confirm
-    if [[ "$confirm" != yes ]]; then warn "已取消删除。"; return 0; fi
-    systemctl disable --now "$unit" >/dev/null 2>&1 || true
-    rm -rf -- "$SELECTED_NODE"
-    ok "节点 ${name} 已删除。"
-    warn "脚本不会自动修改系统防火墙；如之前手动放行过 UDP 端口，可自行删除对应规则。"
-    refresh_traffic_monitor
+# 解析用户输入的节点序号：支持 1 2 3、1,3,5、2-4 以及它们的混合写法，
+# 也支持 a / all 表示全部。解析成功后才写入 SELECTED_NODES（按节点列表顺序去重），
+# 解析失败时不会破坏调用方原有的选择。
+parse_node_selection() {
+    local input="${1:-}" token start end index
+    local -a tokens=()
+    local -a result=()
+    local -A picked=()
+    # 脚本顶部把 IFS 设成了换行/制表符；这里临时改回空白分隔，
+    # 让 read -a 能按空格切分用户输入（local 声明不会影响调用方）。
+    local IFS=$' \t\n'
+
+    # 统一分隔符：中文逗号、顿号、分号、英文逗号、竖线都当作空白分隔。
+    input="${input//，/,}"
+    input="${input//、/,}"
+    input="${input//；/,}"
+    input="${input//;/ }"
+    input="${input//,/ }"
+    input="${input//|/ }"
+
+    # 全部节点：A、ALL、* 都可以。
+    if [[ "$input" =~ ^[[:space:]]*([Aa]([Ll][Ll]?)?|\*)[[:space:]]*$ ]]; then
+        SELECTED_NODES=("${NODE_DIRS[@]}")
+        return 0
+    fi
+
+    read -r -a tokens <<< "$input"
+
+    for token in "${tokens[@]}"; do
+        [[ -z "$token" ]] && continue
+        # 区间写法：2-4 或 2~4
+        if [[ "$token" =~ ^([0-9]+)[-~]([0-9]+)$ ]]; then
+            start=$((10#${BASH_REMATCH[1]}))
+            end=$((10#${BASH_REMATCH[2]}))
+            # 允许倒序输入，例如 5-3 等价于 3-5。
+            if ((start > end)); then
+                index="$start"; start="$end"; end="$index"
+            fi
+            if ((start < 1 || end > ${#NODE_DIRS[@]})); then
+                warn "区间 ${token} 超出范围（1-${#NODE_DIRS[@]}）。"
+                return 1
+            fi
+            for ((index=start; index<=end; index++)); do
+                picked[$((index-1))]=1
+            done
+            continue
+        fi
+        if [[ ! "$token" =~ ^[0-9]+$ ]]; then
+            warn "无法识别选择项：${token}。"
+            return 1
+        fi
+        index=$((10#$token))
+        if ((index < 1 || index > ${#NODE_DIRS[@]})); then
+            warn "序号 ${index} 超出范围（1-${#NODE_DIRS[@]}）。"
+            return 1
+        fi
+        picked[$((index-1))]=1
+    done
+    if ((${#picked[@]} == 0)); then
+        warn "没有选择任何节点。"
+        return 1
+    fi
+
+    # 按节点列表原始顺序输出，保证删除顺序可预期。
+    for ((index=0; index<${#NODE_DIRS[@]}; index++)); do
+        [[ -n "${picked[$index]:-}" ]] && result+=("${NODE_DIRS[$index]}")
+    done
+    SELECTED_NODES=("${result[@]}")
+    return 0
+}
+
+delete_nodes() {
+    local -a to_delete=()
+    local -a deleted_names=()
+    local d node_id name unit confirm input prompt_list
+
+    load_node_dirs || { warn "目前还没有创建任何节点。"; return 0; }
+    show_node_choices
+    echo
+    echo "可一次删除多个节点，输入示例："
+    echo "  1 3 5    删除第 1、3、5 个节点"
+    echo "  2-4      删除第 2 到第 4 个节点"
+    echo "  1,3,5    逗号分隔同样有效"
+    echo "  A        删除全部节点"
+    echo "  0        返回"
+    read -r -p "请选择要删除的节点序号: " input || return 0
+    [[ -z "${input//[[:space:]]/}" ]] && { warn "未输入任何内容，已取消。"; return 0; }
+    input="${input#"${input%%[![:space:]]*}"}"
+    input="${input%"${input##*[![:space:]]}"}"
+    [[ "$input" == 0 ]] && return 0
+    parse_node_selection "$input" || return 0
+    to_delete=("${SELECTED_NODES[@]}")
+    ((${#to_delete[@]} > 0)) || { warn "没有选择任何节点。"; return 0; }
+
+    # 删除前把清单完整列出来，让用户确认的对象和将要删除的对象完全一致。
+    echo
+    info "即将删除以下 ${#to_delete[@]} 个节点："
+    prompt_list=""
+    for d in "${to_delete[@]}"; do
+        node_id="${d##*/}"
+        name="$(read_node_value "$d/name" "$node_id")"
+        printf '  - %s（%s，UDP端口 %s）\n' "$name" "$node_id" "$(read_node_value "$d/port" -)"
+        prompt_list+="${name} "
+    done
+    warn "删除后节点配置、流量统计数据都会一并移除，且不可恢复。"
+    if ((${#to_delete[@]} > 1)); then
+        read -r -p "确认删除这 ${#to_delete[@]} 个节点？请输入 yes 确认: " confirm
+    else
+        read -r -p "确认删除节点「${prompt_list% }」？请输入 yes 确认: " confirm
+    fi
+    if [[ "$confirm" != yes ]]; then
+        warn "已取消删除，没有删除任何节点。"
+        return 0
+    fi
+
+    for d in "${to_delete[@]}"; do
+        node_id="${d##*/}"
+        name="$(read_node_value "$d/name" "$node_id")"
+        unit="${SERVICE_PREFIX}${node_id}.service"
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        if rm -rf -- "$d"; then
+            ok "节点 ${name}（${node_id}）已删除。"
+            deleted_names+=("$name")
+        else
+            error "节点 ${name}（${node_id}）删除失败，请检查目录权限：${d}"
+        fi
+    done
+
+    if ((${#deleted_names[@]} > 0)); then
+        systemctl reset-failed "${SERVICE_PREFIX}*.service" >/dev/null 2>&1 || true
+        ok "本次共删除 ${#deleted_names[@]} 个节点。"
+        warn "脚本不会自动修改系统防火墙；如之前手动放行过 UDP 端口，可自行删除对应规则。"
+        refresh_traffic_monitor
+    else
+        warn "没有节点被删除。"
+    fi
 }
 
 # -------------------------- 查看日志 --------------------------
@@ -1621,6 +1766,15 @@ traffic_management_menu() {
 }
 
 # -------------------------- 在线更新脚本 --------------------------
+# 更新成功后重启脚本：用新脚本替换当前进程，同时保留传入的脚本参数。
+# 菜单会立即以新版本重新加载，而流量监控子进程（--traffic-monitor）不受影响。
+restart_self_exec() {
+    local script="$1"; shift
+    # 用 bash 显式执行新脚本，标准输入/输出/错误会被新进程继承，
+    # 因此交互式菜单和 pause 等按键读取都能正常工作。
+    exec "${BASH:-/bin/bash}" "$script" "$@"
+}
+
 update_script() {
     local tmp backup new_file
 
@@ -1674,8 +1828,18 @@ update_script() {
     fi
 
     ok "脚本在线更新成功。"
-    [[ -f "$backup" ]] && echo "旧版本备份：${backup}"
     install_shortcut
+
+    # 新脚本已就位，备份只用于“替换失败”时回滚；更新成功后不再保留，
+    # 避免旧版本一直留在磁盘上占用空间，也避免日后误运行旧脚本。
+    if [[ -f "$backup" ]]; then
+        if rm -f -- "$backup"; then
+            info "已删除旧版本备份：${backup}"
+        else
+            warn "旧版本备份删除失败，可稍后手动删除：${backup}"
+        fi
+    fi
+    rm -f -- "${SCRIPT_PATH}.new" 2>/dev/null || true
 
     # 流量监控服务执行的是 SCRIPT_PATH；更新后重启，使其加载新版本。
     if systemctl is-enabled --quiet "$TRAFFIC_SERVICE" 2>/dev/null ||
@@ -1685,12 +1849,16 @@ update_script() {
     fi
 
     echo
-    ok "正在自动重新启动管理脚本，以加载刚更新的版本..."
-    sleep 1
-
-    # 用新脚本替换当前管理进程；不会重复启动旧版本菜单。
-    # initialize() 会重新加载配置，并确保快捷命令及流量监控服务使用新版本。
-    exec /bin/bash "$SCRIPT_PATH"
+    if [[ "${HY2_SKIP_SELF_RESTART:-no}" == yes ]]; then
+        info "已跳过自动重启。请退出后重新运行脚本以使用新版本。"
+        return 0
+    fi
+    info "正在重启脚本以加载新版本..."
+    # exec 会直接替换当前进程；只有 exec 本身失败时才会走到下一行。
+    # 使用启动时捕获的参数（函数内的 "$@" 指的是函数自己的位置参数），
+    # 并用参数展开保护空数组：set -u 下展开未赋值的空数组会报未绑定变量。
+    restart_self_exec "$SCRIPT_PATH" ${SCRIPT_ARGS[@]+"${SCRIPT_ARGS[@]}"} || true
+    warn "自动重启脚本失败，请退出菜单后重新运行（sr）以使用新版本。"
 }
 
 # -------------------------- 深度卸载 --------------------------
@@ -1792,7 +1960,7 @@ initialize() {
     if [[ ! -x "$HY2_BIN" ]]; then install_or_update_core; fi
     create_shared_auth
     create_self_signed_cert
-    ensure_cert_fingerprint || exit 1
+    load_cert_sha256 || true
     write_systemd_template
     AUTH_PASS="$(cat "$AUTH_FILE")"
     install_shortcut
@@ -1808,7 +1976,7 @@ show_menu() {
     echo "=============================================="
     echo "  1. 创建节点（DIRECT / SOCKS5）"
     echo "  2. 查看所有节点（显示分享链接）"
-    echo "  3. 删除节点（按序号选择）"
+    echo "  3. 删除节点（可多选）"
     echo "  4. 启动节点（选择单个或所有节点）"
     echo "  5. 停止节点（选择单个或所有节点）"
     echo "  6. 重启所有节点"
@@ -1834,7 +2002,7 @@ main() {
         case "$choice" in
             1) create_node; pause ;;
             2) list_nodes; pause ;;
-            3) delete_node; pause ;;
+            3) delete_nodes; pause ;;
             4) start_nodes_interactive; pause ;;
             5) stop_nodes_interactive; pause ;;
             6) restart_all_nodes; pause ;;
