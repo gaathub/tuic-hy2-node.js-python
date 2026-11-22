@@ -306,6 +306,27 @@ load_cert_sha256() {
     return 1
 }
 
+# -------------------------- systemd 日志策略 --------------------------
+# 全局 journald 最多保留 1 天，并限制日志速率与磁盘占用；部署时立即清理旧日志。
+configure_journal_retention() {
+    local config_dir="/etc/systemd/journald.conf.d"
+    local config_file="${config_dir}/99-hy2-retention.conf"
+    mkdir -p "$config_dir"
+    cat > "$config_file" <<'EOF_JOURNAL'
+[Journal]
+MaxRetentionSec=1day
+MaxFileSec=1day
+SystemMaxUse=200M
+RuntimeMaxUse=100M
+RateLimitIntervalSec=30s
+RateLimitBurst=1000
+EOF_JOURNAL
+    chmod 644 "$config_file"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl try-reload-or-restart systemd-journald >/dev/null 2>&1 || true
+    journalctl --vacuum-time=1d >/dev/null 2>&1 || true
+}
+
 # -------------------------- systemd 节点模板 --------------------------
 write_systemd_template() {
     cat > "$SERVICE_FILE" <<EOF_SERVICE
@@ -702,8 +723,8 @@ ensure_server_addr() {
     info "请输入客户端连接 VPS 时使用的公网 IP 或域名。"
     detected="$(get_public_ip || true)"
     if [[ -n "$detected" ]]; then
-        read -r -p "连接地址 [自动检测：${detected}]（直接回车使用自动检测结果）: " input
-        input="${input:-$detected}"
+        input="$detected"
+        info "已自动检测公网连接地址：${detected}"
     else
         warn "多个公网 IP 查询接口均未成功，请手动输入域名或公网 IP。"
         read -r -p "连接地址: " input
@@ -734,8 +755,18 @@ url_encode() {
     printf '%s' "$output"
 }
 
+print_qr() {
+    local link="$1"
+    if command -v qrencode >/dev/null 2>&1; then
+        echo "二维码："
+        qrencode -t ANSIUTF8 "$link" 2>/dev/null || qrencode -t UTF8 "$link" 2>/dev/null || true
+    else
+        warn "未安装 qrencode，无法显示二维码；可执行 apt install qrencode / dnf install qrencode 后重试。"
+    fi
+}
+
 make_share_link() {
-    local node_name="$1" port="$2" server_addr encoded_name pin=""
+    local node_name="$1" port="$2" server_addr encoded_name pin="" link
     server_addr="$(cat "$SERVER_ADDR_FILE")"
     server_addr="$(uri_host "$server_addr")"
     encoded_name="$(url_encode "$node_name")"
@@ -744,16 +775,19 @@ make_share_link() {
     if [[ "$CERT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
         # 有指纹时启用证书固定校验；不要同时设置 insecure=1，否则部分客户端会跳过 pin 校验。
         pin="&pinSHA256=${CERT_SHA256}"
-        printf 'hysteria2://%s@%s:%s/?sni=%s%s#%s\n' \
-            "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$pin" "$encoded_name"
+        link="hysteria2://${AUTH_PASS}@${server_addr}:${port}/?sni=${SNI_HOST}${pin}#${encoded_name}"
+        printf '%s\n' "$link"
+        print_qr "$link"
         # 额外输出纯链接，供不识别 pinSHA256 的安卓/Clash 客户端使用；客户端需开启跳过证书验证。
         printf '%s\n' '兼容链接（需开启跳过证书验证）：'
-        printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=1#%s\n' \
-            "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$encoded_name"
+        link="hysteria2://${AUTH_PASS}@${server_addr}:${port}/?sni=${SNI_HOST}&insecure=1#${encoded_name}"
+        printf '%s\n' "$link"
+        print_qr "$link"
     else
         # 无法计算指纹时回退为跳过证书验证，保证旧客户端仍可连接。
-        printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=1#%s\n' \
-            "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$encoded_name"
+        link="hysteria2://${AUTH_PASS}@${server_addr}:${port}/?sni=${SNI_HOST}&insecure=1#${encoded_name}"
+        printf '%s\n' "$link"
+        print_qr "$link"
     fi
 }
 
@@ -1982,6 +2016,7 @@ initialize() {
     create_self_signed_cert
     load_cert_sha256 || true
     write_systemd_template
+    configure_journal_retention
     AUTH_PASS="$(cat "$AUTH_FILE")"
     install_shortcut
     migrate_existing_nodes_traffic
