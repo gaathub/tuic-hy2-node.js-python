@@ -6,16 +6,16 @@
   
 * 安装脚本
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy2.sh | sed 's/\r$//')
+bash <(curl -Ls https://raw.githubusercontent.com/gaathub/tuic-hy2-node.js-python/refs/heads/main/hy2.sh | sed 's/\r$//')
 ```
 * 安装原版稳定脚本
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy.sh | sed 's/\r$//')
+bash <(curl -Ls https://raw.githubusercontent.com/gaathub/tuic-hy2-node.js-python/refs/heads/main/hy2.sh | sed 's/\r$//')
 ```
 
 * 卸载脚本
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/kystor/tuic-hy2-node.js-python/refs/heads/main/hy2.sh | sed 's/\r$//') del
+bash <(curl -Ls https://raw.githubusercontent.com/gaathub/tuic-hy2-node.js-python/refs/heads/main/hy2.sh | sed 's/\r$//') del
 ```
 
 
