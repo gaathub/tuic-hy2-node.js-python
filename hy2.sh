@@ -780,9 +780,11 @@ make_share_link() {
     printf '%s\n' "$link"
     print_qr "$link"
     if [[ "$CERT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
-        printf '%s\n' '安全链接（证书 pinSHA256 校验，不要再开启跳过验证）：'
+        printf '%s\n' '兼容安全链接（已开启跳过证书验证，确保客户端显示为 true）：'
+        # 部分客户端（小火煎、v2rayNG、v2rayN）不会把 pinSHA256 映射为 allowInsecure，
+        # 因此该链接显式加入 insecure=1；客户端导入后应显示“跳过证书验证=true”。
         pin="&pinSHA256=${CERT_SHA256}"
-        link="hysteria2://${encoded_pass}@${server_addr}:${port}/?sni=${encoded_sni}${pin}#${encoded_name}"
+        link="hysteria2://${encoded_pass}@${server_addr}:${port}/?sni=${encoded_sni}${pin}&insecure=1#${encoded_name}"
         printf '%s\n' "$link"
         print_qr "$link"
     fi
