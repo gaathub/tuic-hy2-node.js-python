@@ -7,8 +7,9 @@ echo "============================================"
 
 # 部署目录
 XRAY_DIR="/etc/xray"
-mkdir -p $XRAY_DIR
-cd $XRAY_DIR
+VLESS_BIN="$XRAY_DIR/xray"
+mkdir -p "$XRAY_DIR"
+cd "$XRAY_DIR"
 
 # ========== 下载 Xray ==========
 get_xray() {
