@@ -735,25 +735,27 @@ url_encode() {
 }
 
 make_share_link() {
-    local node_name="$1" port="$2" server_addr encoded_name pin=""
+    local node_name="$1" port="$2" server_addr encoded_name encoded_sni encoded_pass pin=""
     server_addr="$(cat "$SERVER_ADDR_FILE")"
     server_addr="$(uri_host "$server_addr")"
     encoded_name="$(url_encode "$node_name")"
+    encoded_sni="$(url_encode "$SNI_HOST")"
+    encoded_pass="$(url_encode "$AUTH_PASS")"
     # 每次生成链接都核对当前证书，避免证书被替换后仍输出旧指纹。
     load_cert_sha256 >/dev/null 2>&1 || true
     if [[ "$CERT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
         # 有指纹时启用证书固定校验；不要同时设置 insecure=1，否则部分客户端会跳过 pin 校验。
         pin="&pinSHA256=${CERT_SHA256}"
         printf 'hysteria2://%s@%s:%s/?sni=%s%s#%s\n' \
-            "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$pin" "$encoded_name"
+            "$encoded_pass" "$server_addr" "$port" "$encoded_sni" "$pin" "$encoded_name"
         # 额外输出纯链接，供不识别 pinSHA256 的安卓/Clash 客户端使用；客户端需开启跳过证书验证。
         printf '%s\n' '兼容链接（需开启跳过证书验证）：'
         printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=1#%s\n' \
-            "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$encoded_name"
+            "$encoded_pass" "$server_addr" "$port" "$encoded_sni" "$encoded_name"
     else
         # 无法计算指纹时回退为跳过证书验证，保证旧客户端仍可连接。
         printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=1#%s\n' \
-            "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$encoded_name"
+            "$encoded_pass" "$server_addr" "$port" "$encoded_sni" "$encoded_name"
     fi
 }
 
