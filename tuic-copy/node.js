@@ -18,6 +18,9 @@ import fs from "fs";
 import https from "https";
 import crypto from "crypto";
 
+// 仅允许部署用户读取认证信息、私钥和链接文件。
+process.umask(0o077);
+
 // ================== 【手动设置 UUID】==================
 // 请将下方双引号内的值替换为您的 UUID
 const UUID = "fdeeda45-0a8e-4570-bcc6-d68c995f5830";  // 修改这里！
@@ -202,7 +205,8 @@ initial_window = 6291456
 
 // ================== 生成链接 ==================
 function generateLink(uuid, password, ip, port, domain) {
-  const link = `tuic://${uuid}:${password}@${ip}:${port}?congestion_control=bbr&alpn=h3&allowInsecure=1&sni=${domain}&udp_relay_mode=native&disable_sni=0&reduce_rtt=1&max_udp_relay_packet_size=8192#TUIC-${ip}`;
+  const linkIp = ip.includes(":") && !ip.startsWith("[") ? `[${ip}]` : ip;
+  const link = `tuic://${encodeURIComponent(uuid)}:${encodeURIComponent(password)}@${linkIp}:${port}?congestion_control=bbr&alpn=h3&allow_insecure=1&sni=${encodeURIComponent(domain)}&udp_relay_mode=native&disable_sni=0&reduce_rtt=1&max_udp_relay_packet_size=8192#TUIC-${encodeURIComponent(ip)}`;
   fs.writeFileSync(LINK_TXT, link);
   console.log("TUIC Link:");
   console.log(link);
