@@ -46,9 +46,14 @@ get_xray() {
 # ========== 生成 VLESS Reality 配置 ==========
 gen_vless_config() {
   local shortId=$(openssl rand -hex 8)
-  local keys=$("$VLESS_BIN" x25519 2>/dev/null || echo "Private key: fallbackpriv1234567890abcdef1234567890abcdef\nPublic key: fallbackpubk1234567890abcdef1234567890abcdef")
-  local priv=$(echo "$keys" | grep Private | awk '{print $3}')
-  local pub=$(echo "$keys" | grep Public | awk '{print $3}')
+  local keys
+  keys=$("$VLESS_BIN" x25519 2>/dev/null) || {
+    echo "无法生成 Reality 密钥，请检查 Xray 核心。" >&2
+    return 1
+  }
+  local priv=$(printf '%s\n' "$keys" | awk '/Private key:/ {print $3; exit}')
+  local pub=$(printf '%s\n' "$keys" | awk '/Public key:/ {print $3; exit}')
+  [[ -n "$priv" && -n "$pub" ]] || { echo "Reality 密钥输出格式无效。" >&2; return 1; }
 
   cat > "$VLESS_CONFIG" <<EOF
 {
@@ -124,7 +129,9 @@ main() {
   get_xray
   gen_vless_config
 
-  ip=$(curl -s https://api64.ipify.org || echo "127.0.0.1")
+  ip=$(curl -fsS --connect-timeout 5 --max-time 10 https://api64.ipify.org | tr -d '[:space:]' || true)
+  if [[ "$ip" == *:* && "$ip" != \[*\] ]]; then ip="[$ip]"; fi
+  [[ -n "$ip" ]] || { echo "无法获取公网地址，请检查网络后重试。" >&2; exit 1; }
   gen_link "$ip"
 
   run_vless
