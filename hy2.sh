@@ -243,7 +243,21 @@ create_shared_auth() {
 }
 
 create_self_signed_cert() {
-    [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]] && return 0
+    local cert_ok=0 key_ok=0 cert_pub="" key_pub=""
+    if [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]]; then
+        # 仅在证书可解析、未过期、私钥可读取且二者匹配时复用。
+        openssl x509 -in "$CERT_FILE" -noout -checkend 0 >/dev/null 2>&1 && cert_ok=1
+        openssl pkey -in "$KEY_FILE" -noout >/dev/null 2>&1 && key_ok=1
+        if (( cert_ok == 1 && key_ok == 1 )); then
+            cert_pub="$(openssl x509 -in "$CERT_FILE" -pubkey -noout 2>/dev/null || true)"
+            key_pub="$(openssl pkey -in "$KEY_FILE" -pubout 2>/dev/null || true)"
+            [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] || key_ok=0
+        fi
+        if (( cert_ok == 1 && key_ok == 1 )); then
+            return 0
+        fi
+        warn "现有证书或私钥无效，将重新生成。"
+    fi
     info "正在生成自签名 TLS 证书（SNI：${SNI_HOST}）..."
     mkdir -p "$CERT_DIR"
     openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
@@ -273,7 +287,7 @@ compute_cert_sha256() {
 }
 
 # 启动时读取并缓存证书指纹。每次都从当前证书重新计算，证书被手动替换后
-# 分享链接也不会继续使用旧指纹；只有 openssl 暂时不可用时才回退到有效缓存。
+# 分享链接也不会继续使用旧指纹；无法读取当前证书时不复用旧缓存。
 load_cert_sha256() {
     local cached="" computed=""
     if computed="$(compute_cert_sha256)"; then
@@ -285,15 +299,10 @@ load_cert_sha256() {
         CERT_SHA256="$computed"
         return 0
     fi
-    if [[ -s "$CERT_SHA256_FILE" ]]; then
-        cached="$(tr -d '[:space:]' < "$CERT_SHA256_FILE" 2>/dev/null | tr 'A-Z' 'a-z' || true)"
-        if [[ "$cached" =~ ^[0-9a-f]{64}$ ]]; then
-            CERT_SHA256="$cached"
-            warn "当前无法读取证书，暂时使用已缓存的 SHA-256 指纹。"
-            return 0
-        fi
-    fi
-    warn "无法计算证书 SHA-256 指纹；分享链接将不带 pinSHA256 参数。"
+    # 无法读取当前证书时绝不回退到缓存指纹：缓存可能已对应旧证书，
+    # 继续使用会让分享链接指向错误的信任锚点。
+    CERT_SHA256=""
+    warn "无法计算当前证书 SHA-256 指纹；分享链接将不带 pinSHA256 参数。"
     return 1
 }
 
@@ -732,9 +741,20 @@ make_share_link() {
     encoded_name="$(url_encode "$node_name")"
     # 每次生成链接都核对当前证书，避免证书被替换后仍输出旧指纹。
     load_cert_sha256 >/dev/null 2>&1 || true
-    [[ "$CERT_SHA256" =~ ^[0-9a-f]{64}$ ]] && pin="&pinSHA256=${CERT_SHA256}"
-    printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=1%s#%s' \
-        "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$pin" "$encoded_name"
+    if [[ "$CERT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+        # 有指纹时启用证书固定校验；不要同时设置 insecure=1，否则部分客户端会跳过 pin 校验。
+        pin="&pinSHA256=${CERT_SHA256}"
+        printf 'hysteria2://%s@%s:%s/?sni=%s%s#%s\n' \
+            "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$pin" "$encoded_name"
+        # 额外输出纯链接，供不识别 pinSHA256 的安卓/Clash 客户端使用；客户端需开启跳过证书验证。
+        printf '%s\n' '兼容链接（需开启跳过证书验证）：'
+        printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=1#%s\n' \
+            "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$encoded_name"
+    else
+        # 无法计算指纹时回退为跳过证书验证，保证旧客户端仍可连接。
+        printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=1#%s\n' \
+            "$AUTH_PASS" "$server_addr" "$port" "$SNI_HOST" "$encoded_name"
+    fi
 }
 
 # -------------------------- 节点列表及选择 --------------------------
