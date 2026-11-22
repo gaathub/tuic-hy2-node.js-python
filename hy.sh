@@ -744,8 +744,8 @@ make_share_link() {
     # 每次生成链接都核对当前证书，避免证书被替换后仍输出旧指纹。
     load_cert_sha256 >/dev/null 2>&1 || true
     if [[ "$CERT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
-        # 有指纹时启用证书固定校验；不要同时设置 insecure=1，否则部分客户端会跳过 pin 校验。
-        pin="&pinSHA256=${CERT_SHA256}"
+        # 为兼容小火煎、v2rayNG、v2rayN，显式加入 insecure=1，确保导入后跳过证书验证为 true。
+        pin="&pinSHA256=${CERT_SHA256}&insecure=1"
         printf 'hysteria2://%s@%s:%s/?sni=%s%s#%s\n' \
             "$encoded_pass" "$server_addr" "$port" "$encoded_sni" "$pin" "$encoded_name"
         # 额外输出纯链接，供不识别 pinSHA256 的安卓/Clash 客户端使用；客户端需开启跳过证书验证。
