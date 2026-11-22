@@ -766,29 +766,29 @@ print_qr() {
 }
 
 make_share_link() {
-    local node_name="$1" port="$2" server_addr encoded_name pin="" link
+    local node_name="$1" port="$2" server_addr encoded_name encoded_sni encoded_pass pin="" link
     server_addr="$(cat "$SERVER_ADDR_FILE")"
     server_addr="$(uri_host "$server_addr")"
     encoded_name="$(url_encode "$node_name")"
+    encoded_sni="$(url_encode "$SNI_HOST")"
+    encoded_pass="$(url_encode "$AUTH_PASS")"
     # 每次生成链接都核对当前证书，避免证书被替换后仍输出旧指纹。
     load_cert_sha256 >/dev/null 2>&1 || true
+    # 兼容链接放在第一位：安卓客户端和多数 GUI 会据此自动跳过自签证书校验。
+    printf '%s\n' '兼容链接（已开启跳过证书验证，适用于安卓/Clash 导入）：'
+    link="hysteria2://${encoded_pass}@${server_addr}:${port}/?sni=${encoded_sni}&insecure=1#${encoded_name}"
+    printf '%s\n' "$link"
+    print_qr "$link"
     if [[ "$CERT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
-        # 有指纹时启用证书固定校验；不要同时设置 insecure=1，否则部分客户端会跳过 pin 校验。
+        printf '%s\n' '安全链接（证书 pinSHA256 校验，不要再开启跳过验证）：'
         pin="&pinSHA256=${CERT_SHA256}"
-        link="hysteria2://${AUTH_PASS}@${server_addr}:${port}/?sni=${SNI_HOST}${pin}#${encoded_name}"
-        printf '%s\n' "$link"
-        print_qr "$link"
-        # 额外输出纯链接，供不识别 pinSHA256 的安卓/Clash 客户端使用；客户端需开启跳过证书验证。
-        printf '%s\n' '兼容链接（需开启跳过证书验证）：'
-        link="hysteria2://${AUTH_PASS}@${server_addr}:${port}/?sni=${SNI_HOST}&insecure=1#${encoded_name}"
-        printf '%s\n' "$link"
-        print_qr "$link"
-    else
-        # 无法计算指纹时回退为跳过证书验证，保证旧客户端仍可连接。
-        link="hysteria2://${AUTH_PASS}@${server_addr}:${port}/?sni=${SNI_HOST}&insecure=1#${encoded_name}"
+        link="hysteria2://${encoded_pass}@${server_addr}:${port}/?sni=${encoded_sni}${pin}#${encoded_name}"
         printf '%s\n' "$link"
         print_qr "$link"
     fi
+    echo 'Clash Meta 配置（自签证书兼容）：'
+    printf '  - name: %s\n' "$node_name"
+    printf '    type: hysteria2\n    server: %s\n    port: %s\n    password: %s\n    sni: %s\n    skip-cert-verify: true\n    alpn:\n      - h3\n' "${server_addr#[}" "${port}" "$AUTH_PASS" "$SNI_HOST"
 }
 
 # -------------------------- 节点列表及选择 --------------------------
