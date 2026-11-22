@@ -30,7 +30,7 @@ const TUIC_PASSWORD = execSync('openssl rand -hex 16').toString().trim();
 
 function generateTuicCert() {
   if (!fs.existsSync(TUIC_CERT) || !fs.existsSync(TUIC_KEY)) {
-    execSync(`openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -keyout "${TUIC_KEY}" -out "${TUIC_CERT}" -subj "/CN=${MASQ_DOMAIN}" -days 365 -nodes`);
+    execSync(`openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -keyout "${TUIC_KEY}" -out "${TUIC_CERT}" -subj "/CN=${MASQ_DOMAIN}" -addext "subjectAltName=DNS:${MASQ_DOMAIN}" -sha256 -days 365 -nodes`);
     fs.chmodSync(TUIC_KEY, 0o600);
     fs.chmodSync(TUIC_CERT, 0o644);
   }
@@ -60,8 +60,10 @@ alpn = ["h3"]
 }
 
 function generateTuicLink() {
-  const IP = execSync('curl -s https://api64.ipify.org || echo 127.0.0.1').toString().trim();
-  const content = `tuic://${TUIC_UUID}:${TUIC_PASSWORD}@${IP}:${TUIC_PORT}?congestion_control=bbr&alpn=h3&allowInsecure=1&sni=${MASQ_DOMAIN}&udp_relay_mode=native#TUIC-${IP}`;
+  const IP = execSync('curl -4 -s https://api.ipify.org || echo 127.0.0.1').toString().trim();
+  // URI 中 IPv6 主机必须使用方括号；allow_insecure 是 TUIC v5 通用参数名。
+  const host = IP.includes(':') && !IP.startsWith('[') ? `[${IP}]` : IP;
+  const content = `tuic://${encodeURIComponent(TUIC_UUID)}:${encodeURIComponent(TUIC_PASSWORD)}@${host}:${TUIC_PORT}?congestion_control=bbr&alpn=h3&allow_insecure=1&sni=${encodeURIComponent(MASQ_DOMAIN)}&udp_relay_mode=native#TUIC-${encodeURIComponent(IP)}`;
   fs.writeFileSync(TUIC_LINK, content);
   console.log('🔗 TUIC 链接:\n' + content);
 }
