@@ -506,9 +506,7 @@ start_hysteria() {
     fi
 
     echo "🚀 正在后台启动 Hysteria2..."
-    # 本地文件日志仅保留当前运行内容，启动前清理旧日志，避免持续刷盘。
-    : > "$LOG_FILE"
-    nohup "$BIN_PATH" server -c server.yaml >>"$LOG_FILE" 2>&1 &
+    nohup "$BIN_PATH" server -c server.yaml >"$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     sleep 1
 
@@ -678,27 +676,12 @@ EOF_DIRECT
 
 # ======================== 输出节点链接 ========================
 get_server_ip() {
-    local ip url
-    local urls=("https://api.ipify.org" "https://ipv4.icanhazip.com" "https://checkip.amazonaws.com" "https://ifconfig.co/ip")
-    for url in "${urls[@]}"; do
-        ip="$(curl -4fsS --connect-timeout 5 --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
-        [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && { printf '%s' "$ip"; return 0; }
-    done
-    for url in "https://api6.ipify.org" "https://ipv6.icanhazip.com" "https://v6.ident.me"; do
-        ip="$(curl -6fsS --connect-timeout 5 --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
-        [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]] && { printf '%s' "$ip"; return 0; }
-    done
-    return 1
-}
-
-print_qr() {
-    local link="$1"
-    if has_cmd qrencode; then
-        echo "📱 二维码："
-        qrencode -t ANSIUTF8 "$link" 2>/dev/null || qrencode -t UTF8 "$link" 2>/dev/null || true
-    else
-        echo "⚠️ 未安装 qrencode，无法显示二维码；可执行 apt install qrencode / dnf install qrencode 后重试。"
+    local ip
+    ip="$(curl -4fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    if [ -z "$ip" ]; then
+        ip="$(curl -4fsS --max-time 10 https://ipv4.icanhazip.com 2>/dev/null || true)"
     fi
+    echo "${ip:-YOUR_SERVER_IP}"
 }
 
 print_connection_info() {
@@ -726,9 +709,7 @@ print_connection_info() {
 
     echo ""
     echo "📱 节点链接（SNI=${SNI}, ALPN=${ALPN}, 跳过证书验证）:"
-    local link="hysteria2://${AUTH_PASSWORD}@${ip}:${SERVER_PORT}?sni=${SNI}&alpn=${ALPN}&insecure=1#Hy2-SOCKS5"
-    echo "$link"
-    print_qr "$link"
+    echo "hysteria2://${AUTH_PASSWORD}@${ip}:${SERVER_PORT}?sni=${SNI}&alpn=${ALPN}&insecure=1#Hy2-SOCKS5"
     echo ""
     echo "📝 运行文件:"
     echo "   📄 配置文件: $(pwd)/server.yaml"
