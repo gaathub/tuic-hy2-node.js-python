@@ -192,39 +192,19 @@ init_auth() {
 }
 
 get_ip() {
-    local ip="" url
-    local urls=("https://api.ipify.org" "https://ipv4.icanhazip.com" "https://checkip.amazonaws.com" "https://ifconfig.co/ip")
-    for url in "${urls[@]}"; do
-        ip="$(curl -4 -fsS --connect-timeout 5 --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
-        [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && { printf '%s' "$ip"; return 0; }
-    done
-    for url in "https://api6.ipify.org" "https://ipv6.icanhazip.com" "https://v6.ident.me"; do
-        ip="$(curl -6 -fsS --connect-timeout 5 --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
-        [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]] && { printf '%s' "$ip"; return 0; }
-    done
-    return 1
-}
-
-print_qr() {
-    local link="$1"
-    if has_cmd qrencode; then
-        echo "二维码："
-        qrencode -t ANSIUTF8 "$link" 2>/dev/null || qrencode -t UTF8 "$link" 2>/dev/null || true
-    else
-        warn "未安装 qrencode，无法显示二维码；可执行 apt install qrencode / dnf install qrencode 后重试。"
+    local ip=""
+    ip="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+    if [[ -z "$ip" ]]; then
+        ip="$(curl -6 -fsS --max-time 8 https://api64.ipify.org 2>/dev/null || true)"
     fi
+    printf '%s' "$ip"
 }
 
 init_ip() {
     if [[ -s "$IP_FILE" ]]; then
         PUBLIC_IP="$(cat "$IP_FILE")"
-        if [[ ! "$PUBLIC_IP" =~ ^([0-9]{1,3}(\.[0-9]{1,3}){3}|[0-9A-Fa-f:]+)$ ]]; then
-            warn "已保存的公网地址格式无效，将重新自动检测。"
-            PUBLIC_IP=""
-        fi
-    fi
-    if [[ -z "$PUBLIC_IP" ]]; then
-        PUBLIC_IP="$(get_ip || true)"
+    else
+        PUBLIC_IP="$(get_ip)"
         if [[ -z "$PUBLIC_IP" ]]; then
             read -r -p "无法自动获取公网地址，请输入 VPS 公网 IP 或域名：" PUBLIC_IP
         fi
@@ -323,25 +303,6 @@ check_port() {
         fi
     done
     return 0
-}
-
-configure_journal_retention() {
-    local config_dir="/etc/systemd/journald.conf.d"
-    local config_file="${config_dir}/99-tuic-retention.conf"
-    mkdir -p "$config_dir"
-    cat > "$config_file" <<'EOF_JOURNAL'
-[Journal]
-MaxRetentionSec=1day
-MaxFileSec=1day
-SystemMaxUse=200M
-RuntimeMaxUse=100M
-RateLimitIntervalSec=30s
-RateLimitBurst=1000
-EOF_JOURNAL
-    chmod 644 "$config_file"
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl try-reload-or-restart systemd-journald >/dev/null 2>&1 || true
-    journalctl --vacuum-time=1d >/dev/null 2>&1 || true
 }
 
 install_service() {
@@ -704,10 +665,8 @@ print_link() {
     echo "端口：$NODE_PORT"
     echo "出站模式：$MODE"
     echo "UUID：$UUID"
-    local link
-    link="tuic://${UUID}:${PASSWORD}@${link_ip}:${NODE_PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${SNI}&allow_insecure=1#${NODE_NAME}"
-    printf '%s\n' "$link"
-    print_qr "$link"
+    printf 'tuic://%s:%s@%s:%s?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=%s&allow_insecure=1#%s\n' \
+        "$UUID" "$PASSWORD" "$link_ip" "$NODE_PORT" "$SNI" "$NODE_NAME"
     echo "================================================"
 }
 
@@ -975,7 +934,6 @@ main() {
     fi
 
     install_service
-    configure_journal_retention
 
     local script_path
     script_path="$(readlink -f "${BASH_SOURCE[0]}")"
