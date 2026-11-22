@@ -11,7 +11,7 @@ IFS=$'\n\t'
 
 # -------------------------- 基础路径 --------------------------
 # 在线更新脚本的链接地址
-SCRIPT_URL=""
+SCRIPT_URL="https://raw.githubusercontent.com/gaathub/tuic-hy2-node.js-python/refs/heads/main/hy2.sh"
 
 HY2_HOME="/opt/hy2"
 HY2_BIN="${HY2_HOME}/bin/hysteria"
