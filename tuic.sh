@@ -393,6 +393,7 @@ EOF
       "heartbeat": "10s",
       "tls": {
         "enabled": true,
+        "alpn": ["h3"],
         "certificate_path": $(json_quote "$CERT"),
         "key_path": $(json_quote "$KEY")
       }
